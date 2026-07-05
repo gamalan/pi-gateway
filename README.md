@@ -2,6 +2,8 @@
 
 Hermes-style messaging gateway for pi — a multi-platform agent with per-chat sessions, background task support, and allowlist security.
 
+> Fork of [0xKobold/pi-gateway](https://github.com/0xKobold/pi-gateway) with config-based UID allowlisting.
+
 ## Features
 
 - **Multi-platform adapters** — Discord, Telegram, Slack, Twitch, WhatsApp, WebSocket
@@ -13,8 +15,19 @@ Hermes-style messaging gateway for pi — a multi-platform agent with per-chat s
 
 ## Installation
 
+Pi supports installing extensions directly from GitHub:
+
 ```bash
-pi install npm:@0xkobold/pi-gateway
+pi install github:gamalan/pi-gateway
+```
+
+Or clone and build manually:
+
+```bash
+git clone https://github.com/gamalan/pi-gateway.git
+cd pi-gateway
+bun install && bun run build
+pi install .
 ```
 
 Requires pi coding agent (`@earendil-works/pi-coding-agent >= 0.80.3`) and `@sinclair/typebox >= 0.32.0`.
