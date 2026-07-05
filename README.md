@@ -158,6 +158,7 @@ When `requirePairing` is enabled and a user is not in the allowlist:
 | `/gateway status` | Show running status, platforms, sessions |
 | `/gateway pair [code]` | List pending codes or approve one |
 | `/gateway allow [platform] [userId]` | List allowlist or add a user |
+| `/gateway revoke <platform> <userId>` | Remove a user from the DB allowlist |
 | `/gateway sessions` | List active chat sessions |
 | `/gateway tasks` | List background tasks |
 | `/gateway config` | Show current configuration |

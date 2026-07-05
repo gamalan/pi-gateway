@@ -47,6 +47,7 @@ import {
 	listPendingPairingCodes,
 	addToAllowlist,
 	listAllowlistedUsers,
+	revokeUserAccess,
 	type Platform,
 } from "./security/auth.js";
 import {
@@ -647,6 +648,7 @@ export default function (pi: ExtensionAPI) {
 				"restart",
 				"pair",
 				"allow",
+				"revoke",
 				"sessions",
 				"tasks",
 				"config",
@@ -823,12 +825,34 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 
-					addToAllowlist(platform, userId);
-					ctx.ui.notify(`Added ${userId} to allowlist`, "info");
+				addToAllowlist(platform, userId);
+				ctx.ui.notify(`Added ${userId} to allowlist`, "info");
+				return;
+			}
+
+			case "revoke": {
+				const platform = parts[1] as Platform;
+				const userId = parts[2];
+				if (!platform || !userId) {
+					ctx.ui.notify(
+						"Usage: /gateway revoke <platform> <userId>\n" +
+						"Removes a user from the DB allowlist.",
+						"info",
+					);
 					return;
 				}
 
-				case "sessions": {
+				const removed = revokeUserAccess(platform, userId);
+				ctx.ui.notify(
+					removed
+						? `Removed ${userId} from allowlist`
+						: `${userId} was not in the allowlist`,
+					removed ? "info" : "error",
+				);
+				return;
+			}
+
+			case "sessions": {
 					const sessions = listSessions();
 					ctx.ui.notify(
 						"Active sessions:\n" +
@@ -885,6 +909,7 @@ export default function (pi: ExtensionAPI) {
 							"  /gateway status       - Show status\n" +
 							"  /gateway pair <code>  - Approve pairing\n" +
 							"  /gateway allow <p> <u>- Add user to allowlist\n" +
+							"  /gateway revoke <p> <u>- Remove user from allowlist\n" +
 							"  /gateway sessions     - List sessions\n" +
 							"  /gateway tasks        - List background tasks\n" +
 							"  /gateway config       - Show config\n\n" +
