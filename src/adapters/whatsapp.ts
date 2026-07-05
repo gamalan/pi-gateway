@@ -9,6 +9,7 @@
  */
 
 import { BaseAdapter, type PlatformMessage, type PlatformConfig } from "./base.js";
+import { logger } from "../logger.js";
 
 export interface WhatsAppConfig extends PlatformConfig {
   platform: "whatsapp";
@@ -58,8 +59,8 @@ export class WhatsAppAdapter extends BaseAdapter {
       // Handle QR code
       this.sock.ev.on("qr", (qr: string) => {
         this.qrCode = qr;
-        console.log("[WhatsApp] QR Code received - scan with WhatsApp app");
-        console.log(qr);
+        logger.info("[WhatsApp] QR Code received - scan with WhatsApp app");
+        logger.info(qr);
       });
 
       // Handle connection update
@@ -70,11 +71,11 @@ export class WhatsAppAdapter extends BaseAdapter {
         if (connection === "open") {
           this.connected = true;
           this.qrCode = null;
-          console.log("[WhatsApp] Connected!");
+          logger.info("[WhatsApp] Connected!");
         }
         if (connection === "close") {
           this.connected = false;
-          console.log("[WhatsApp] Disconnected");
+          logger.info("[WhatsApp] Disconnected");
         }
       });
 
@@ -86,9 +87,9 @@ export class WhatsAppAdapter extends BaseAdapter {
         this.handleMessages(messages);
       });
 
-      console.log("[WhatsApp] Initializing...");
+      logger.info("[WhatsApp] Initializing...");
     } catch (err) {
-      console.error("[WhatsApp] Failed to initialize:", err);
+      logger.error("[WhatsApp] Failed to initialize:", err);
       throw err;
     }
   }
@@ -139,7 +140,7 @@ export class WhatsAppAdapter extends BaseAdapter {
     }
 
     if (!this.connected) {
-      console.warn("[WhatsApp] Not yet connected - waiting for QR scan");
+      logger.warn("[WhatsApp] Not yet connected - waiting for QR scan");
     }
   }
 
@@ -170,7 +171,7 @@ export class WhatsAppAdapter extends BaseAdapter {
       const result = await this.sock.sendMessage(channelId, { text });
       return result?.key?.id || this.generateMessageId();
     } catch (err) {
-      console.error("[WhatsApp] Send error:", err);
+      logger.error("[WhatsApp] Send error:", err);
       throw err;
     }
   }
@@ -187,7 +188,7 @@ export class WhatsAppAdapter extends BaseAdapter {
       });
       return result?.key?.id || this.generateMessageId();
     } catch (err) {
-      console.error("[WhatsApp] Send image error:", err);
+      logger.error("[WhatsApp] Send image error:", err);
       throw err;
     }
   }
@@ -202,7 +203,7 @@ export class WhatsAppAdapter extends BaseAdapter {
         react: { text: emoji, key: { remoteJid: channelId, id: messageId } },
       });
     } catch (err) {
-      console.error("[WhatsApp] Reaction error:", err);
+      logger.error("[WhatsApp] Reaction error:", err);
     }
   }
 
@@ -221,7 +222,7 @@ export class WhatsAppAdapter extends BaseAdapter {
       });
       return result?.key?.id || this.generateMessageId();
     } catch (err) {
-      console.error("[WhatsApp] Reply error:", err);
+      logger.error("[WhatsApp] Reply error:", err);
       throw err;
     }
   }
@@ -240,7 +241,7 @@ export class WhatsAppAdapter extends BaseAdapter {
         },
       }, {});
     } catch (err) {
-      console.error("[WhatsApp] Edit error:", err);
+      logger.error("[WhatsApp] Edit error:", err);
     }
   }
 
@@ -254,7 +255,7 @@ export class WhatsAppAdapter extends BaseAdapter {
         delete: { remoteJid: channelId, id: messageId },
       });
     } catch (err) {
-      console.error("[WhatsApp] Delete error:", err);
+      logger.error("[WhatsApp] Delete error:", err);
     }
   }
 

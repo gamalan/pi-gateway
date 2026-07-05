@@ -9,6 +9,7 @@
  */
 
 import { BaseAdapter, type PlatformMessage, type PlatformConfig } from "./base.js";
+import { logger } from "../logger.js";
 
 interface TelegramConfig extends PlatformConfig {
   platform: "telegram";
@@ -60,7 +61,7 @@ export class TelegramAdapter extends BaseAdapter {
       throw new Error(`Telegram auth failed: ${response.status}`);
     }
     
-    console.log(`[Telegram] Bot initialized: @${data.result?.username}`);
+    logger.info(`[Telegram] Bot initialized: @${data.result?.username}`);
     
     // Set webhook if configured
     if (this.config.mode === "webhook" && this.config.webhookUrl) {
@@ -68,7 +69,7 @@ export class TelegramAdapter extends BaseAdapter {
         method: "POST",
         body: JSON.stringify({ url: this.config.webhookUrl }),
       });
-      console.log(`[Telegram] Webhook set: ${this.config.webhookUrl}`);
+      logger.info(`[Telegram] Webhook set: ${this.config.webhookUrl}`);
     }
   }
 
@@ -109,7 +110,7 @@ export class TelegramAdapter extends BaseAdapter {
         });
 
         if (!response.ok) {
-          console.error(`[Telegram] Poll error: ${response.status}`);
+          logger.error(`[Telegram] Poll error: ${response.status}`);
           await this.sleep(5000);
           continue;
         }
@@ -123,7 +124,7 @@ export class TelegramAdapter extends BaseAdapter {
           }
         }
       } catch (err) {
-        console.error("[Telegram] Poll exception:", err);
+        logger.error("[Telegram] Poll exception:", err);
         await this.sleep(5000);
       }
     }

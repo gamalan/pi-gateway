@@ -9,6 +9,7 @@
  */
 
 import { BaseAdapter, type PlatformMessage, type PlatformConfig } from "./base.js";
+import { logger } from "../logger.js";
 
 export interface TwitchConfig extends PlatformConfig {
   platform: "twitch";
@@ -64,7 +65,7 @@ export class TwitchAdapter extends BaseAdapter {
 
   async initialize(): Promise<void> {
     await this.authenticate();
-    console.log(`[Twitch] Adapter initialized for ${this.subscribedChannels.size} channels`);
+    logger.info(`[Twitch] Adapter initialized for ${this.subscribedChannels.size} channels`);
   }
 
   private async authenticate(): Promise<void> {
@@ -115,7 +116,7 @@ export class TwitchAdapter extends BaseAdapter {
     this.eventsubWs = new WebSocket("wss://eventsub.wss.twitch.tv/ws");
 
     this.eventsubWs.onopen = () => {
-      console.log("[Twitch] EventSub WebSocket connected");
+      logger.info("[Twitch] EventSub WebSocket connected");
     };
 
     this.eventsubWs.onmessage = async (event) => {
@@ -123,14 +124,14 @@ export class TwitchAdapter extends BaseAdapter {
     };
 
     this.eventsubWs.onclose = () => {
-      console.log("[Twitch] EventSub WebSocket closed");
+      logger.info("[Twitch] EventSub WebSocket closed");
       this.callbacks?.onDisconnect?.();
       // Reconnect after 5 seconds
       setTimeout(() => this.connectEventSub(), 5000);
     };
 
     this.eventsubWs.onerror = (error) => {
-      console.error("[Twitch] EventSub error:", error);
+      logger.error("[Twitch] EventSub error:", error);
     };
   }
 
@@ -142,7 +143,7 @@ export class TwitchAdapter extends BaseAdapter {
       switch (type) {
         case "session_welcome": {
           this.eventsubSessionId = msg.payload.session.id;
-          console.log(`[Twitch] EventSub session: ${this.eventsubSessionId}`);
+          logger.info(`[Twitch] EventSub session: ${this.eventsubSessionId}`);
           // Subscribe to events for each channel
           for (const channel of this.subscribedChannels) {
             await this.subscribeToChannel(channel);
@@ -184,7 +185,7 @@ export class TwitchAdapter extends BaseAdapter {
           break;
       }
     } catch (err) {
-      console.error("[Twitch] EventSub parse error:", err);
+      logger.error("[Twitch] EventSub parse error:", err);
     }
   }
 
@@ -198,13 +199,13 @@ export class TwitchAdapter extends BaseAdapter {
     const broadcaster = userData.data[0];
 
     if (!broadcaster) {
-      console.warn(`[Twitch] Channel not found: ${channel}`);
+      logger.warn(`[Twitch] Channel not found: ${channel}`);
       return;
     }
 
     // Note: Subscription creation requires webhook transport
     // For WebSocket, events are received if the user has a subscription
-    console.log(`[Twitch] Monitoring channel: ${channel} (${broadcaster.id})`);
+    logger.info(`[Twitch] Monitoring channel: ${channel} (${broadcaster.id})`);
   }
 
   async stop(): Promise<void> {
@@ -219,7 +220,7 @@ export class TwitchAdapter extends BaseAdapter {
   async sendMessage(channelId: string, content: string): Promise<string> {
     // Twitch doesn't support chat via API (requires IRC or EventSub Chat)
     // For now, this is a no-op - chat messages must come through EventSub Chat
-    console.warn("[Twitch] sendMessage not supported - use IRC for chat");
+    logger.warn("[Twitch] sendMessage not supported - use IRC for chat");
     return this.generateMessageId();
   }
 

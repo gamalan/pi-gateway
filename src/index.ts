@@ -15,16 +15,17 @@
  *   /gateway pair <code>    - Approve pairing code
  */
 
-import { homedir, platform } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import {
 	createServer,
 	type IncomingMessage,
 	type ServerResponse,
 } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
-import { randomBytes, createHmac } from "node:crypto";
+import { randomBytes } from "node:crypto";
+import { spawn } from "node:child_process";
 
 import type {
 	ExtensionAPI,
@@ -39,6 +40,7 @@ import {
 	touchSession,
 	type SessionConfig,
 } from "./sessions/store.js";
+import { logger } from "./logger.js";
 import {
 	initSecurityStore,
 	isUserAllowed,
@@ -56,7 +58,6 @@ import {
 	getPendingResultsForSession,
 	markTaskDelivered,
 	listTasks,
-	type BackgroundTask,
 } from "./background/manager.js";
 import { DiscordAdapter } from "./adapters/discord.js";
 import { TwitchAdapter } from "./adapters/twitch.js";
@@ -69,8 +70,8 @@ import type {
 	PlatformMessage,
 } from "./adapters/base.js";
 
-const KOBOLD_DIR = join(homedir(), ".0xkobold");
-const CONFIG_DIR = join(KOBOLD_DIR, "gateway");
+const GATEWAY_DIR = join(homedir(), ".pi");
+const CONFIG_DIR = join(GATEWAY_DIR, "gateway");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 
 // Types
@@ -180,15 +181,6 @@ function loadConfig(): GatewayConfig {
 	return { ...DEFAULT_CONFIG };
 }
 
-function saveConfig(): void {
-	try {
-		if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
-		writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
-	} catch {
-		/* ignore */
-	}
-}
-
 // Token auth
 function verifyToken(token: string): boolean {
 	if (config.tokens.length === 0) return true;
@@ -215,27 +207,9 @@ function broadcastClients(event: string, data: unknown): void {
 	}
 }
 
-function broadcastPlatform(
-	platform: string,
-	event: string,
-	data: unknown,
-): void {
-	for (const [clientId, ws] of state.clients) {
-		// Get client's session to check platform
-		const session = Array.from(state.sessions.values()).find(
-			(s) => s.userId === clientId,
-		);
-		if (session?.platform === platform) {
-			sendWs(ws, { type: event, data });
-		}
-	}
-}
-
 // RPC to pi agent
 function createRpcProcess(): any {
-	const { spawn } = require("node:child_process");
-
-	const proc = spawn("pi", ["--mode", "rpc", "--json"], {
+	const proc = spawn("pi", ["--mode", "rpc"], {
 		stdio: ["pipe", "pipe", "pipe"],
 		env: {
 			...process.env,
@@ -270,11 +244,11 @@ function createRpcProcess(): any {
 	});
 
 	proc.stderr?.on("data", (data: Buffer) => {
-		console.error("[gateway] pi stderr:", data.toString());
+		logger.info("[gateway] pi stderr:", data.toString().trim());
 	});
 
 	proc.on("exit", (code: number) => {
-		console.log("[gateway] pi process exited");
+		logger.info("[gateway] pi process exited");
 		rpcProcess = null;
 		broadcastClients("agent_disconnected", { code });
 	});
@@ -329,7 +303,7 @@ const adapterCallbacks: AdapterCallbacks = {
 
 		// Check allowlist
 		if (!isUserAllowed(message.platform as Platform, message.userId)) {
-			console.log(`[gateway] User ${message.userId} not in allowlist`);
+			logger.info(`[gateway] User ${message.userId} not in allowlist`);
 			// Could send a DM here about pairing flow
 			return;
 		}
@@ -346,7 +320,7 @@ const adapterCallbacks: AdapterCallbacks = {
 		}
 	},
 	onDisconnect: () => {
-		console.log("[gateway] Platform adapter disconnected");
+		logger.info("[gateway] Platform adapter disconnected");
 		updateStatus();
 	},
 };
@@ -365,9 +339,9 @@ async function initializeAdapters(): Promise<void> {
 			await discord.initialize();
 			await discord.start(adapterCallbacks);
 			state.adapters.set("discord", discord);
-			console.log("[gateway] Discord adapter started");
+			logger.info("[gateway] Discord adapter started");
 		} catch (err) {
-			console.error("[gateway] Failed to start Discord adapter:", err);
+			logger.error("[gateway] Failed to start Discord adapter:", err);
 		}
 	}
 
@@ -388,9 +362,9 @@ async function initializeAdapters(): Promise<void> {
 			await twitch.initialize();
 			await twitch.start(adapterCallbacks);
 			state.adapters.set("twitch", twitch);
-			console.log("[gateway] Twitch adapter started");
+			logger.info("[gateway] Twitch adapter started");
 		} catch (err) {
-			console.error("[gateway] Failed to start Twitch adapter:", err);
+			logger.error("[gateway] Failed to start Twitch adapter:", err);
 		}
 	}
 
@@ -407,9 +381,9 @@ async function initializeAdapters(): Promise<void> {
 			await telegram.initialize();
 			await telegram.start(adapterCallbacks);
 			state.adapters.set("telegram", telegram);
-			console.log("[gateway] Telegram adapter started");
+			logger.info("[gateway] Telegram adapter started");
 		} catch (err) {
-			console.error("[gateway] Failed to start Telegram adapter:", err);
+			logger.error("[gateway] Failed to start Telegram adapter:", err);
 		}
 	}
 
@@ -428,9 +402,9 @@ async function initializeAdapters(): Promise<void> {
 			await slack.initialize();
 			await slack.start(adapterCallbacks);
 			state.adapters.set("slack", slack);
-			console.log("[gateway] Slack adapter started");
+			logger.info("[gateway] Slack adapter started");
 		} catch (err) {
-			console.error("[gateway] Failed to start Slack adapter:", err);
+			logger.error("[gateway] Failed to start Slack adapter:", err);
 		}
 	}
 
@@ -446,9 +420,9 @@ async function initializeAdapters(): Promise<void> {
 			await whatsapp.initialize();
 			await whatsapp.start(adapterCallbacks);
 			state.adapters.set("whatsapp", whatsapp);
-			console.log("[gateway] WhatsApp adapter started");
+			logger.info("[gateway] WhatsApp adapter started");
 		} catch (err) {
-			console.error("[gateway] Failed to start WhatsApp adapter:", err);
+			logger.error("[gateway] Failed to start WhatsApp adapter:", err);
 		}
 	}
 }
@@ -567,7 +541,7 @@ function handleWebSocket(ws: WebSocket, req: IncomingMessage): void {
 	const clientId = randomBytes(8).toString("hex");
 	state.clients.set(clientId, ws);
 
-	console.log(`[gateway] WebSocket client connected: ${clientId}`);
+	logger.info(`[gateway] WebSocket client connected: ${clientId}`);
 
 	sendWs(ws, { type: "connected", data: { clientId } });
 
@@ -603,7 +577,7 @@ function handleWebSocket(ws: WebSocket, req: IncomingMessage): void {
 
 	ws.on("close", () => {
 		state.clients.delete(clientId);
-		console.log(`[gateway] WebSocket client disconnected: ${clientId}`);
+		logger.info(`[gateway] WebSocket client disconnected: ${clientId}`);
 	});
 }
 
@@ -612,7 +586,6 @@ function updateStatus(): void {
 	if (!globalCtx) return;
 
 	const adapterCount = state.adapters.size;
-	const clientCount = state.clients.size;
 
 	const statusText = state.running
 		? adapterCount > 0
@@ -679,7 +652,7 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					server.listen(port, config.host, () => {
-						console.log(
+						logger.info(
 							`[gateway] HTTP server started on ${config.host}:${port}`,
 						);
 					});
@@ -775,8 +748,8 @@ export default function (pi: ExtensionAPI) {
 
 				case "pair": {
 					const code = parts[1]?.toUpperCase();
-					if (!code) {
-						const pending = listPendingPairingCodes();
+					const pending = code ? null : listPendingPairingCodes();
+					if (pending) {
 						ctx.ui.notify(
 							"Pending pairing codes:\n" +
 								(pending.length > 0
@@ -803,15 +776,15 @@ export default function (pi: ExtensionAPI) {
 				case "allow": {
 					const platform = parts[1] as Platform;
 					const userId = parts[2];
-					if (!platform || !userId) {
-						const list = listAllowlistedUsers();
-						const configUids = config.security.allowedUids ?? {};
-						const configLines: string[] = [];
-						for (const [plat, uids] of Object.entries(configUids)) {
-							for (const uid of uids) {
-								configLines.push(`${plat}:${uid} (config)`);
-							}
+					const list = listAllowlistedUsers();
+					const configUids = config.security.allowedUids ?? {};
+					const configLines: string[] = [];
+					for (const [plat, uids] of Object.entries(configUids)) {
+						for (const uid of uids) {
+							configLines.push(`${plat}:${uid} (config)`);
 						}
+					}
+					if (!platform || !userId) {
 						ctx.ui.notify(
 							"Allowlisted users:\n" +
 								(list.length > 0 || configLines.length > 0
@@ -825,34 +798,34 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 
-				addToAllowlist(platform, userId);
-				ctx.ui.notify(`Added ${userId} to allowlist`, "info");
-				return;
-			}
+					addToAllowlist(platform, userId);
+					ctx.ui.notify(`Added ${userId} to allowlist`, "info");
+					return;
+				}
 
-			case "revoke": {
-				const platform = parts[1] as Platform;
-				const userId = parts[2];
-				if (!platform || !userId) {
+				case "revoke": {
+					const platform = parts[1] as Platform;
+					const userId = parts[2];
+					if (!platform || !userId) {
+						ctx.ui.notify(
+							"Usage: /gateway revoke <platform> <userId>\n" +
+								"Removes a user from the DB allowlist.",
+							"info",
+						);
+						return;
+					}
+
+					const removed = revokeUserAccess(platform, userId);
 					ctx.ui.notify(
-						"Usage: /gateway revoke <platform> <userId>\n" +
-						"Removes a user from the DB allowlist.",
-						"info",
+						removed
+							? `Removed ${userId} from allowlist`
+							: `${userId} was not in the allowlist`,
+						removed ? "info" : "error",
 					);
 					return;
 				}
 
-				const removed = revokeUserAccess(platform, userId);
-				ctx.ui.notify(
-					removed
-						? `Removed ${userId} from allowlist`
-						: `${userId} was not in the allowlist`,
-					removed ? "info" : "error",
-				);
-				return;
-			}
-
-			case "sessions": {
+				case "sessions": {
 					const sessions = listSessions();
 					ctx.ui.notify(
 						"Active sessions:\n" +
@@ -1093,5 +1066,5 @@ export default function (pi: ExtensionAPI) {
 		updateStatus();
 	});
 
-	console.log("[pi-gateway] Hermes-style gateway extension loaded");
+	logger.info("[pi-gateway] Hermes-style gateway extension loaded");
 }

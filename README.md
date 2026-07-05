@@ -18,7 +18,7 @@ Hermes-style messaging gateway for pi — a multi-platform agent with per-chat s
 Pi supports installing extensions directly from GitHub:
 
 ```bash
-pi install github:gamalan/pi-gateway
+pi install git:github.com/gamalan/pi-gateway
 ```
 
 Or clone and build manually:
@@ -49,7 +49,7 @@ The gateway starts on `http://localhost:3847` by default. See `/gateway config` 
 
 ## Configuration
 
-Configuration lives at `~/.0xkobold/gateway/config.json`:
+Configuration lives at `~/.pi/gateway/config.json`:
 
 ```jsonc
 {
@@ -94,7 +94,7 @@ Configuration lives at `~/.0xkobold/gateway/config.json`:
     },
     "whatsapp": {
       "enabled": true,
-      "sessionPath": "~/.0xkobold/whatsapp-session",
+      "sessionPath": "~/.pi/whatsapp-session",
       "printQr": true
     }
   }
@@ -119,7 +119,7 @@ Manage users at runtime via `/gateway` commands:
 
 ### Config-file pre-approved UIDs
 
-Skip pairing entirely by listing UIDs in `~/.0xkobold/gateway-security.json`:
+Skip pairing entirely by listing UIDs in `~/.pi/gateway-security.json`:
 
 ```jsonc
 {
@@ -211,7 +211,7 @@ Each chat gets an isolated session with configurable reset policies:
 - **idle** — Session resets after N minutes of inactivity
 - **both** — Whichever triggers first
 
-Sessions persist across gateway restarts in `~/.0xkobold/gateway-sessions.db`.
+Sessions persist across gateway restarts in `~/.pi/gateway-sessions.db`.
 
 ## Background Tasks
 

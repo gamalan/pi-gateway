@@ -3,6 +3,7 @@
  */
 
 import { BaseAdapter, type PlatformMessage, type PlatformConfig } from "./base.js";
+import { logger } from "../logger.js";
 
 export interface WebSocketConfig extends PlatformConfig {
   platform: "websocket";
@@ -23,7 +24,7 @@ export class WebSocketAdapter extends BaseAdapter {
   }
 
   async initialize(): Promise<void> {
-    console.log(`[WebSocket] Adapter initialized for client ${this.config.clientId}`);
+    logger.info(`[WebSocket] Adapter initialized for client ${this.config.clientId}`);
   }
 
   async start(callbacks): Promise<void> {
@@ -42,7 +43,7 @@ export class WebSocketAdapter extends BaseAdapter {
       this.client = new WebSocket(url, { headers });
 
       this.client.onopen = () => {
-        console.log(`[WebSocket] Connected to ${url}`);
+        logger.info(`[WebSocket] Connected to ${url}`);
         this.reconnectAttempts = 0;
         resolve();
       };
@@ -64,18 +65,18 @@ export class WebSocketAdapter extends BaseAdapter {
             this.emitMessage(message);
           }
         } catch (err) {
-          console.error("[WebSocket] Failed to parse message:", err);
+          logger.error("[WebSocket] Failed to parse message:", err);
         }
       };
 
       this.client.onclose = () => {
-        console.log("[WebSocket] Connection closed");
+        logger.info("[WebSocket] Connection closed");
         this.callbacks?.onDisconnect?.();
         this.attemptReconnect(url, token);
       };
 
       this.client.onerror = (err) => {
-        console.error("[WebSocket] Error:", err);
+        logger.error("[WebSocket] Error:", err);
         reject(err);
       };
     });
@@ -85,7 +86,7 @@ export class WebSocketAdapter extends BaseAdapter {
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
       const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
-      console.log(`[WebSocket] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
+      logger.info(`[WebSocket] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
       setTimeout(() => this.connect(url, token), delay);
     }
   }

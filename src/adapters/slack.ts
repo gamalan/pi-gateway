@@ -9,6 +9,7 @@
  */
 
 import { BaseAdapter, type PlatformMessage, type PlatformConfig } from "./base.js";
+import { logger } from "../logger.js";
 
 export interface SlackConfig extends PlatformConfig {
   platform: "slack";
@@ -54,9 +55,9 @@ export class SlackAdapter extends BaseAdapter {
         throw new Error(`Slack auth failed: ${data}`);
       }
       
-      console.log(`[Slack] Bot initialized for team: ${data.team_id}`);
+      logger.info(`[Slack] Bot initialized for team: ${data.team_id}`);
     } else if (this.config.webhookUrl) {
-      console.log("[Slack] Using webhook mode (outbound only)");
+      logger.info("[Slack] Using webhook mode (outbound only)");
     } else {
       throw new Error("Slack requires either botToken or webhookUrl");
     }
@@ -79,7 +80,7 @@ export class SlackAdapter extends BaseAdapter {
     this.connected = true;
     
     if (!this.config.botToken && !this.config.webhookUrl) {
-      console.warn("[Slack] No credentials configured - adapter is outbound-only");
+      logger.warn("[Slack] No credentials configured - adapter is outbound-only");
     }
   }
 

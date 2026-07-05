@@ -10,6 +10,7 @@
  */
 
 import { BaseAdapter, type PlatformMessage, type PlatformConfig } from "./base.js";
+import { logger } from "../logger.js";
 
 export interface DiscordConfig extends PlatformConfig {
   platform: "discord";
@@ -45,7 +46,7 @@ export class DiscordAdapter extends BaseAdapter {
     if (!response.ok) {
       throw new Error(`Discord authentication failed: ${response.status}`);
     }
-    console.log(`[Discord] Bot initialized: ${data.username}`);
+    logger.info(`[Discord] Bot initialized: ${data.username}`);
   }
 
   private async apiRequest(endpoint: string, options: RequestInit = {}): Promise<Response> {
@@ -71,7 +72,7 @@ export class DiscordAdapter extends BaseAdapter {
     this.wsConnection = new WebSocket(gatewayUrl);
 
     this.wsConnection.onopen = () => {
-      console.log("[Discord] WebSocket connected");
+      logger.info("[Discord] WebSocket connected");
     };
 
     this.wsConnection.onmessage = async (event) => {
@@ -80,7 +81,7 @@ export class DiscordAdapter extends BaseAdapter {
     };
 
     this.wsConnection.onclose = () => {
-      console.log("[Discord] WebSocket closed");
+      logger.info("[Discord] WebSocket closed");
       this.callbacks?.onDisconnect?.();
       // Attempt reconnect after 5 seconds
       setTimeout(() => this.start(callbacks), 5000);
@@ -137,7 +138,7 @@ export class DiscordAdapter extends BaseAdapter {
     switch (type) {
       case "READY":
         this.sessionId = data.session_id;
-        console.log(`[Discord] Logged in as ${data.user.username}`);
+        logger.info(`[Discord] Logged in as ${data.user.username}`);
         break;
 
       case "MESSAGE_CREATE":
@@ -255,7 +256,7 @@ export class DiscordAdapter extends BaseAdapter {
     options?: any[];
   }>): Promise<void> {
     if (!this.config.guildId) {
-      console.warn("[Discord] guildId required for slash commands");
+      logger.warn("[Discord] guildId required for slash commands");
       return;
     }
 
@@ -264,6 +265,6 @@ export class DiscordAdapter extends BaseAdapter {
       body: JSON.stringify(commands),
     });
     
-    console.log(`[Discord] Registered ${commands.length} slash commands`);
+    logger.info(`[Discord] Registered ${commands.length} slash commands`);
   }
 }
