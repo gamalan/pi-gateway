@@ -1,6 +1,6 @@
 {
   "name": "@gamalan/pi-gateway",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "description": "Hermes-style messaging gateway for pi - multi-platform agent with sessions, security, and background tasks",
   "author": "0xKobold <original>; forked by gamalan",
   "license": "MIT",

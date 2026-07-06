@@ -105,8 +105,10 @@ export class TelegramAdapter extends BaseAdapter {
 		const url = `https://api.telegram.org/bot${this.config.token}${endpoint}`;
 		return fetch(url, {
 			...options,
+			signal: AbortSignal.timeout(35_000), // slightly above Telegram's 30s long-poll
 			headers: {
 				"Content-Type": "application/json",
+				"Connection": "close", // prevent stale undici connections
 				...options.headers,
 			},
 		});
@@ -137,6 +139,7 @@ export class TelegramAdapter extends BaseAdapter {
 	}
 
 	private async longPoll(): Promise<void> {
+		let backoff = 1000; // start at 1s, max ~30s
 		while (this.pollingActive) {
 			try {
 				const response = await this.apiRequest("/getUpdates", {
@@ -147,8 +150,11 @@ export class TelegramAdapter extends BaseAdapter {
 					}),
 				});
 
+				// Reset backoff on successful connection
+				backoff = 1000;
+
 				if (!response.ok) {
-					logger.error(`[Telegram] Poll error: ${response.status}`);
+					logger.error(`[Telegram] Poll HTTP ${response.status}`);
 					await this.sleep(5000);
 					continue;
 				}
@@ -165,8 +171,12 @@ export class TelegramAdapter extends BaseAdapter {
 					}
 				}
 			} catch (err) {
-				logger.error("[Telegram] Poll exception:", err);
-				await this.sleep(5000);
+				// Transient network errors are expected on long-lived connections
+				logger.warn(
+					`[Telegram] Poll retry in ${Math.round(backoff / 1000)}s — ${(err as Error).message || err}`,
+				);
+				await this.sleep(backoff);
+				backoff = Math.min(backoff * 2, 30_000);
 			}
 		}
 	}
