@@ -1,15 +1,17 @@
 # pi-gateway
 
-Hermes-style messaging gateway for pi — a multi-platform agent with per-chat sessions, background task support, and allowlist security.
+Multi-platform chat bridge for pi — connect your AI agent to Telegram, Discord, Slack, and more. Real-time streaming, per-chat sessions, background tasks, and role-based access control.
 
 > Fork of [0xKobold/pi-gateway](https://github.com/0xKobold/pi-gateway) with config-based UID allowlisting.
 
 ## Features
 
 - **Multi-platform adapters** — Discord, Telegram, Slack, Twitch, WhatsApp, WebSocket
+- **Real-time streaming** — responses appear token-by-token via live message editing
 - **Per-chat sessions** — isolated conversations with configurable reset policies (daily / idle)
 - **Background tasks** — spawn async work from chats, results delivered when ready
-- **Allowlist security** — DB-based and config-file pre-approved UIDs, optional DM pairing flow
+- **Allowlist security** — DB-based and config-file pre-approved UIDs, admin roles, tool access policies
+- **Detached daemon mode** — `/gateway start -d` or `pi-gateway start -d` keeps the gateway alive after pi closes
 - **HTTP + WebSocket API** — connect external clients, send prompts, receive streaming responses
 - **pi-native** — runs as a pi extension with `/gateway` slash commands and registered tools
 

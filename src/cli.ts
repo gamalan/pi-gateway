@@ -27,7 +27,9 @@ function isRunning(): { running: boolean; pid?: number } {
 	} catch {
 		try {
 			unlinkSync(PID_FILE);
-		} catch { /* stale */ }
+		} catch {
+			/* stale */
+		}
 		return { running: false };
 	}
 }
@@ -59,12 +61,8 @@ switch (cmd) {
 			process.argv.includes("-d") || process.argv.includes("--detached");
 
 		if (!isDetached) {
-			console.log(
-				"Use 'pi-gateway start -d' to start as a detached daemon.",
-			);
-			console.log(
-				"Use '/gateway start' inside pi to run the gateway inline.",
-			);
+			console.log("Use 'pi-gateway start -d' to start as a detached daemon.");
+			console.log("Use '/gateway start' inside pi to run the gateway inline.");
 			process.exit(1);
 		}
 
@@ -84,9 +82,7 @@ switch (cmd) {
 		child.unref();
 
 		console.log(`✅ Gateway daemon started (PID ${child.pid}).`);
-		console.log(
-			"   It will keep running after this terminal closes.",
-		);
+		console.log("   It will keep running after this terminal closes.");
 		console.log("   Logs: ~/.pi/gateway/gateway.log");
 		break;
 	}
@@ -108,10 +104,14 @@ switch (cmd) {
 				console.log("Daemon didn't stop gracefully — forcing...");
 				try {
 					process.kill(pid!, "SIGKILL");
-				} catch { /* already dead */ }
+				} catch {
+					/* already dead */
+				}
 				try {
 					unlinkSync(PID_FILE);
-				} catch { /* ignore */ }
+				} catch {
+					/* ignore */
+				}
 			}
 			console.log("✅ Gateway daemon stopped.");
 		}, 2000);
@@ -138,14 +138,15 @@ switch (cmd) {
 			const port = config.port || 3847;
 
 			try {
-				const resp = execSync(
-					`curl -s http://localhost:${port}/api/status`,
-					{ timeout: 3000 },
-				);
+				const resp = execSync(`curl -s http://localhost:${port}/api/status`, {
+					timeout: 3000,
+				});
 				const status = JSON.parse(resp.toString());
 				console.log(`Port: ${port}`);
 				console.log(`Running: ${status.running ? "yes" : "no"}`);
-				console.log(`Adapters: ${(status.adapters || []).join(", ") || "none"}`);
+				console.log(
+					`Adapters: ${(status.adapters || []).join(", ") || "none"}`,
+				);
 				console.log(`Agent connected: ${status.agent ? "yes" : "no"}`);
 			} catch {
 				console.log(`Port: ${port} (API unreachable — may still be starting)`);
