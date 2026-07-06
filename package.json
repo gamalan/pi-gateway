@@ -1,6 +1,6 @@
 {
   "name": "@gamalan/pi-gateway",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "Hermes-style messaging gateway for pi - multi-platform agent with sessions, security, and background tasks",
   "author": "0xKobold <original>; forked by gamalan",
   "license": "MIT",
@@ -39,7 +39,7 @@
     "test": "npx tsx tests/index.ts",
     "demo": "npx tsx tests/demo-server.ts",
     "client": "npx tsx tests/client-demo.ts",
-    "prepublishOnly": "rm -rf dist && tsc"
+    "prepublishOnly": "tsc"
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1",
