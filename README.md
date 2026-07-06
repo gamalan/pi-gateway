@@ -15,7 +15,13 @@ Hermes-style messaging gateway for pi — a multi-platform agent with per-chat s
 
 ## Installation
 
-Pi supports installing extensions directly from GitHub:
+Install from npm (recommended):
+
+```bash
+pi install npm:@gamalan/pi-gateway
+```
+
+Or install directly from GitHub:
 
 ```bash
 pi install git:github.com/gamalan/pi-gateway
@@ -26,7 +32,7 @@ Or clone and build manually:
 ```bash
 git clone https://github.com/gamalan/pi-gateway.git
 cd pi-gateway
-bun install && bun run build
+npm install && npm run build
 pi install .
 ```
 
