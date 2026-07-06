@@ -193,6 +193,10 @@ interface PendingCompletion {
 	resolve: (text: string) => void;
 	reject: (err: Error) => void;
 	timer: ReturnType<typeof setTimeout>;
+	/** Called with accumulated streaming text as deltas arrive */
+	onStream?: (text: string) => void;
+	/** Accumulated streamed text from text_delta events */
+	streamedText: string;
 }
 const pendingCompletions: PendingCompletion[] = [];
 
@@ -296,6 +300,19 @@ function createRpcProcess(): any {
 					}
 				}
 
+				// Stream text deltas to active completion
+				if (
+					msg.type === "message_update" &&
+					msg.assistantMessageEvent?.type === "text_delta" &&
+					typeof msg.assistantMessageEvent.delta === "string"
+				) {
+					const completion = pendingCompletions[0];
+					if (completion?.onStream) {
+						completion.streamedText += msg.assistantMessageEvent.delta;
+						completion.onStream(completion.streamedText);
+					}
+				}
+
 				// Broadcast events
 				if (msg.type === "response") {
 					broadcastClients("response", msg);
@@ -383,7 +400,11 @@ function extractAgentEndText(agentEndMsg: Record<string, unknown>): string {
 // Send a prompt to pi and wait for agent_end to get the full response text.
 // Unlike sendRpc (which resolves with the ACK), this resolves with the
 // actual assistant response text after the agent finishes processing.
-async function sendPromptRpc(message: string): Promise<string> {
+// If onStream is provided, it is called with accumulated text as deltas arrive.
+async function sendPromptRpc(
+	message: string,
+	onStream?: (text: string) => void,
+): Promise<string> {
 	if (!rpcProcess) throw new Error("pi agent not running");
 
 	// Send the prompt and wait for the ACK (so we know the prompt was accepted)
@@ -409,10 +430,15 @@ async function sendPromptRpc(message: string): Promise<string> {
 			);
 		}, timeoutMs);
 
-		pendingCompletions.push({ resolve, reject, timer });
+		pendingCompletions.push({
+			resolve,
+			reject,
+			timer,
+			onStream,
+			streamedText: "",
+		});
 	});
 }
-
 
 const adapterCallbacks: AdapterCallbacks = {
 	onMessage: async (message: PlatformMessage) => {
@@ -446,32 +472,71 @@ const adapterCallbacks: AdapterCallbacks = {
 
 		// Send to pi agent with tool policy guard
 		if (rpcProcess) {
+			const adapter = state.adapters.get(message.platform);
 			const guard = buildPolicyGuard(message.platform, message.userId);
+
+			// Send an initial placeholder message so we can stream edits into it
+			let sentId: string | undefined;
+			if (adapter) {
+				try {
+					sentId = await adapter.sendMessage(message.channelId, "▌");
+				} catch {
+					// If sendMessage itself fails, don't even try to process
+					logger.error(
+						"[gateway] Failed to send initial placeholder message",
+					);
+					return;
+				}
+			}
+
 			try {
 				logger.info(
 					`[gateway] Sending prompt from ${message.platform}/${message.userId} (session: ${session.id.slice(0, 12)}...)`,
 				);
 
-				// Use sendPromptRpc which waits for agent_end (the real response),
-				// NOT the ACK which has no content
+				// Stream deltas into the placeholder message, then wait for agent_end
+				let lastEditTime = 0;
+				const EDIT_THROTTLE_MS = 400; // max 2.5 edits/sec to avoid rate limits
 				const responseText = await sendPromptRpc(
 					`${guard}\n\n${message.content}`,
+					adapter && sentId
+						? (streamText: string) => {
+								const now = Date.now();
+								if (now - lastEditTime >= EDIT_THROTTLE_MS) {
+									lastEditTime = now;
+									adapter
+												.editMessage(message.channelId, sentId!, streamText)
+												.catch(() => {});
+								}
+							}
+						: undefined,
 				);
 
 				logger.info(
 					`[gateway] Response received, length: ${responseText.length}, sending back to ${message.platform}/${message.channelId}`,
 				);
 
-				if (responseText) {
-					const adapter = state.adapters.get(message.platform);
-					if (adapter) {
+				if (responseText && adapter) {
+					if (sentId) {
+						// Final edit — replace streaming placeholder with complete text
+						await adapter.editMessage(
+							message.channelId,
+							sentId,
+							responseText,
+						);
+					} else {
 						await adapter.sendMessage(message.channelId, responseText);
-						logger.info("[gateway] Response sent to platform successfully");
 					}
-				} else {
+					logger.info("[gateway] Response sent to platform successfully");
+				} else if (!responseText && adapter) {
 					logger.warn("[gateway] Response text was empty — nothing to send");
-					const adapter = state.adapters.get(message.platform);
-					if (adapter) {
+					if (sentId) {
+						await adapter.editMessage(
+							message.channelId,
+							sentId,
+							"I processed your message but had no text response. Please try again.",
+						);
+					} else {
 						await adapter.sendMessage(
 							message.channelId,
 							"I processed your message but had no text response. Please try again.",
@@ -480,13 +545,19 @@ const adapterCallbacks: AdapterCallbacks = {
 				}
 			} catch (err) {
 				logger.error("[gateway] RPC error processing message:", err);
-				const adapter = state.adapters.get(message.platform);
 				if (adapter) {
 					try {
-						await adapter.sendMessage(
-							message.channelId,
-							"Sorry, I encountered an error processing your message. Please try again.",
-						);
+						const errorMsg =
+							"Sorry, I encountered an error processing your message. Please try again.";
+						if (sentId) {
+							await adapter.editMessage(
+								message.channelId,
+								sentId,
+								errorMsg,
+							);
+						} else {
+							await adapter.sendMessage(message.channelId, errorMsg);
+						}
 					} catch (sendErr) {
 						logger.error("[gateway] Failed to send error message:", sendErr);
 					}
