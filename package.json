@@ -1,9 +1,12 @@
 {
-  "name": "pi-gateway",
-  "version": "0.4.0",
+  "name": "@gamalan/pi-gateway",
+  "version": "1.0.0",
   "description": "Hermes-style messaging gateway for pi - multi-platform agent with sessions, security, and background tasks",
   "author": "0xKobold <original>; forked by gamalan",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "keywords": ["pi-package", "pi-extension", "gateway", "messaging", "hermes", "multi-platform"],
   "type": "module",
   "main": "dist/index.js",
