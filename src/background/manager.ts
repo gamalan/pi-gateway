@@ -56,7 +56,7 @@ interface TaskRow {
 	delivered_at: number | null;
 }
 
-const GATEWAY_DIR = join(homedir(), ".pi");
+const GATEWAY_DIR = join(homedir(), ".pi", "gateway");
 const TASKS_DB = join(GATEWAY_DIR, "gateway-background-tasks.db");
 
 let db: Database.Database | null = null;

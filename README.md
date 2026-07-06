@@ -329,7 +329,7 @@ Each chat gets an isolated session with configurable reset policies:
 - **idle** — Session resets after N minutes of inactivity
 - **both** — Whichever triggers first
 
-Sessions persist across gateway restarts in `~/.pi/gateway-sessions.db`.
+Sessions persist across gateway restarts in `~/.pi/gateway/gateway-sessions.db`.
 
 ## Background Tasks
 

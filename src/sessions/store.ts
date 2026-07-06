@@ -44,7 +44,7 @@ interface SessionRow {
 	parent_session_id: string | null;
 }
 
-const GATEWAY_DIR = join(homedir(), ".pi");
+const GATEWAY_DIR = join(homedir(), ".pi", "gateway");
 const SESSIONS_DB = join(GATEWAY_DIR, "gateway-sessions.db");
 
 let db: Database.Database | null = null;

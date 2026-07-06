@@ -447,7 +447,13 @@ const adapterCallbacks: AdapterCallbacks = {
 		// Check allowlist
 		if (!isUserAllowed(message.platform as Platform, message.userId)) {
 			logger.info(`[gateway] User ${message.userId} not in allowlist`);
-			// Could send a DM here about pairing flow
+			const adapter = state.adapters.get(message.platform);
+			if (adapter) {
+				await adapter.sendMessage(
+					message.channelId,
+					"You are not allowed to use this agent. Contact the administrator to request access.",
+				);
+			}
 			return;
 		}
 

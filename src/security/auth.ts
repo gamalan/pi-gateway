@@ -57,7 +57,7 @@ interface RateLimitEntry {
 	windowStart: number;
 }
 
-const GATEWAY_DIR = join(homedir(), ".pi");
+const GATEWAY_DIR = join(homedir(), ".pi", "gateway");
 const SECURITY_DB = join(GATEWAY_DIR, "gateway-security.db");
 
 let db: Database.Database | null = null;
