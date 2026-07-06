@@ -103,6 +103,8 @@ interface GatewayConfig {
 			windowMs: number;
 		};
 	};
+	/** Timeout in ms for waiting on pi agent to respond (default: 300000 = 5 min) */
+	promptTimeoutMs?: number;
 	sessions: {
 		resetPolicy: "daily" | "idle" | "both";
 		dailyHour: number;
@@ -166,6 +168,7 @@ const DEFAULT_CONFIG: GatewayConfig = {
 		dailyHour: 4,
 		idleMinutes: 1440,
 	},
+	promptTimeoutMs: 300000, // 5 minutes — override to increase for slow models
 	platforms: {},
 };
 
@@ -393,43 +396,24 @@ async function sendPromptRpc(message: string): Promise<string> {
 	logger.info("[gateway] Prompt ACK received, waiting for agent_end...");
 
 	// Wait for agent_end to deliver the full response
+	const timeoutMs = config.promptTimeoutMs ?? 300000;
+	const minutes = Math.round(timeoutMs / 60000);
 	return new Promise((resolve, reject) => {
 		const timer = setTimeout(() => {
 			const idx = pendingCompletions.findIndex((c) => c.timer === timer);
 			if (idx !== -1) pendingCompletions.splice(idx, 1);
 			reject(
 				new Error(
-					"Prompt completion timeout — no agent_end received within 5 minutes",
+					`Prompt completion timeout — no agent_end received within ${minutes} minute${minutes === 1 ? "" : "s"}`,
 				),
 			);
-		}, 300000); // 5 minutes
+		}, timeoutMs);
 
 		pendingCompletions.push({ resolve, reject, timer });
 	});
 }
 
-// Extract response text from pi RPC response (kept for backward compat with old sendRpc)
-// pi responds with JSON lines on stdout;
-// the response shape varies but typically contains `text` or `content`
-function extractRpcResponseText(response: unknown): string {
-	if (typeof response === "string") return response;
-	const r = response as Record<string, unknown>;
-	if (r.text && typeof r.text === "string") return r.text;
-	if (r.content) {
-		// OpenAI-style content array: [{ type: "text", text: "..." }]
-		if (Array.isArray(r.content)) {
-			return (r.content as Array<Record<string, unknown>>)
-				.filter((c) => c.type === "text" && typeof c.text === "string")
-				.map((c) => c.text as string)
-				.join("\n");
-		}
-		if (typeof r.content === "string") return r.content;
-	}
-	// Fallback — the response might be something we don't recognise
-	return "";
-}
 
-// Platform adapter callbacks
 const adapterCallbacks: AdapterCallbacks = {
 	onMessage: async (message: PlatformMessage) => {
 		// Get or create session for this chat

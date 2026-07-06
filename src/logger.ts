@@ -22,11 +22,19 @@ function formatTimestamp(): string {
 	return new Date().toISOString();
 }
 
+function serializeArg(a: unknown): string {
+	if (typeof a === "string") return a;
+	if (a instanceof Error) return a.stack || a.message;
+	try {
+		return JSON.stringify(a);
+	} catch {
+		return String(a);
+	}
+}
+
 function writeLog(level: string, ...args: unknown[]): void {
 	ensureLogDir();
-	const message = args
-		.map((a) => (typeof a === "string" ? a : JSON.stringify(a)))
-		.join(" ");
+	const message = args.map(serializeArg).join(" ");
 	const line = `[${formatTimestamp()}] [${level}] ${message}\n`;
 	try {
 		appendFileSync(LOG_FILE, line, "utf-8");
