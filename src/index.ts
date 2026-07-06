@@ -273,9 +273,15 @@ function createRpcProcess(): any {
 		},
 	});
 
+	let lineBuffer = "";
 	proc.stdout?.on("data", (data: Buffer) => {
-		const lines = data.toString().split("\n").filter(Boolean);
+		lineBuffer += data.toString();
+		const lines = lineBuffer.split("\n");
+		// Keep the last (possibly incomplete) chunk in the buffer
+		lineBuffer = lines.pop() || "";
+
 		for (const line of lines) {
+			if (!line) continue;
 			try {
 				const msg = JSON.parse(line);
 
@@ -320,7 +326,10 @@ function createRpcProcess(): any {
 					broadcastClients("event", msg);
 				}
 			} catch {
-				/* not JSON */
+				logger.debug(
+					"[gateway] Failed to parse RPC line:",
+					line.slice(0, 200),
+				);
 			}
 		}
 	});
@@ -331,7 +340,26 @@ function createRpcProcess(): any {
 
 	proc.on("exit", (code: number) => {
 		logger.info("[gateway] pi process exited");
-		// Reject any pending completions so they don't hang forever
+		// Flush any remaining line in the buffer (could be a large agent_end)
+		if (lineBuffer.trim()) {
+			try {
+				const msg = JSON.parse(lineBuffer.trim());
+				if (msg.type === "agent_end") {
+					const text = extractAgentEndText(msg);
+					logger.info(
+						`[gateway] agent_end flushed from buffer on exit, text length: ${text.length}`,
+					);
+					const completion = pendingCompletions.shift();
+					if (completion) {
+						clearTimeout(completion.timer);
+						completion.resolve(text);
+					}
+				}
+			} catch {
+				logger.debug("[gateway] Unparseable data in stdout buffer on exit");
+			}
+		}
+		// Reject any remaining pending completions so they don't hang forever
 		while (pendingCompletions.length > 0) {
 			const completion = pendingCompletions.shift()!;
 			clearTimeout(completion.timer);
@@ -482,9 +510,7 @@ const adapterCallbacks: AdapterCallbacks = {
 					sentId = await adapter.sendMessage(message.channelId, "▌");
 				} catch {
 					// If sendMessage itself fails, don't even try to process
-					logger.error(
-						"[gateway] Failed to send initial placeholder message",
-					);
+					logger.error("[gateway] Failed to send initial placeholder message");
 					return;
 				}
 			}
@@ -505,8 +531,8 @@ const adapterCallbacks: AdapterCallbacks = {
 								if (now - lastEditTime >= EDIT_THROTTLE_MS) {
 									lastEditTime = now;
 									adapter
-												.editMessage(message.channelId, sentId!, streamText)
-												.catch(() => {});
+										.editMessage(message.channelId, sentId!, streamText)
+										.catch(() => {});
 								}
 							}
 						: undefined,
@@ -519,11 +545,7 @@ const adapterCallbacks: AdapterCallbacks = {
 				if (responseText && adapter) {
 					if (sentId) {
 						// Final edit — replace streaming placeholder with complete text
-						await adapter.editMessage(
-							message.channelId,
-							sentId,
-							responseText,
-						);
+						await adapter.editMessage(message.channelId, sentId, responseText);
 					} else {
 						await adapter.sendMessage(message.channelId, responseText);
 					}
@@ -550,11 +572,7 @@ const adapterCallbacks: AdapterCallbacks = {
 						const errorMsg =
 							"Sorry, I encountered an error processing your message. Please try again.";
 						if (sentId) {
-							await adapter.editMessage(
-								message.channelId,
-								sentId,
-								errorMsg,
-							);
+							await adapter.editMessage(message.channelId, sentId, errorMsg);
 						} else {
 							await adapter.sendMessage(message.channelId, errorMsg);
 						}
