@@ -16,7 +16,14 @@
  */
 
 import { join } from "node:path";
-import { existsSync, readFileSync, copyFileSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
+import {
+	existsSync,
+	readFileSync,
+	copyFileSync,
+	mkdirSync,
+	writeFileSync,
+	unlinkSync,
+} from "node:fs";
 import {
 	createServer,
 	type IncomingMessage,
@@ -194,7 +201,11 @@ function isDaemonRunning(): boolean {
 		return true;
 	} catch {
 		// Stale PID file — process no longer running
-		try { unlinkSync(PID_FILE); } catch { /* ignore */ }
+		try {
+			unlinkSync(PID_FILE);
+		} catch {
+			/* ignore */
+		}
 		return false;
 	}
 }
@@ -946,95 +957,83 @@ export default function (pi: ExtensionAPI) {
 			const subcmd = parts[0]?.toLowerCase();
 
 			switch (subcmd) {
-			case "start": {
-				const isDetached =
-					parts.includes("-d") || parts.includes("--detached");
+				case "start": {
+					const isDetached =
+						parts.includes("-d") || parts.includes("--detached");
 
-				if (isDetached) {
-					// Check if already running
-					if (
-						existsSync(PID_FILE) &&
-						isDaemonRunning()
-					) {
+					if (isDetached) {
+						// Check if already running
+						if (existsSync(PID_FILE) && isDaemonRunning()) {
+							ctx.ui.notify("Gateway daemon is already running.", "info");
+							return;
+						}
+
+						// Spawn detached daemon
+						const entryPoint = new URL("../dist/index.js", import.meta.url)
+							.pathname;
+						const child = spawn(process.execPath, [entryPoint, "--daemon"], {
+							detached: true,
+							stdio: "ignore",
+							env: process.env,
+						});
+						child.unref();
+
 						ctx.ui.notify(
-							"Gateway daemon is already running.",
+							`🔌 Gateway daemon started (PID ${child.pid}).\n\n` +
+								"It will keep running after pi closes.\n" +
+								"Use /gateway status to check, /gateway stop to kill.",
 							"info",
 						);
 						return;
 					}
 
-					// Spawn detached daemon
-					const entryPoint = new URL(
-						"../dist/index.js",
-						import.meta.url,
-					).pathname;
-					const child = spawn(
-						process.execPath,
-						[entryPoint, "--daemon"],
-						{
-							detached: true,
-							stdio: "ignore",
-							env: process.env,
-						},
-					);
-					child.unref();
+					if (state.running) {
+						ctx.ui.notify("Gateway already running", "info");
+						return;
+					}
+
+					// Reload config fresh on every start so users can edit
+					// ~/.pi/gateway/config.json without restarting pi
+					config = loadConfig();
+					const port = parseInt(parts[1]) || config.port;
+
+					await startGatewayServer(port);
 
 					ctx.ui.notify(
-						`🔌 Gateway daemon started (PID ${child.pid}).\n\n` +
-							"It will keep running after pi closes.\n" +
-							"Use /gateway status to check, /gateway stop to kill.",
+						`✅ Gateway started on http://${config.host}:${port}\n\n` +
+							`Platforms: ${state.adapters.size > 0 ? Array.from(state.adapters.keys()).join(", ") : "none"}\n` +
+							`Sessions: Idle reset every ${config.sessions.idleMinutes} min`,
 						"info",
 					);
 					return;
 				}
 
-				if (state.running) {
-					ctx.ui.notify("Gateway already running", "info");
-					return;
-				}
-
-				// Reload config fresh on every start so users can edit
-				// ~/.pi/gateway/config.json without restarting pi
-				config = loadConfig();
-				const port = parseInt(parts[1]) || config.port;
-
-				await startGatewayServer(port);
-
-				ctx.ui.notify(
-					`✅ Gateway started on http://${config.host}:${port}\n\n` +
-						`Platforms: ${state.adapters.size > 0 ? Array.from(state.adapters.keys()).join(", ") : "none"}\n` +
-						`Sessions: Idle reset every ${config.sessions.idleMinutes} min`,
-					"info",
-				);
-				return;
-			}
-
-			case "stop": {
-				// Handle daemon mode first
-				if (isDaemonRunning()) {
-					try {
-						const rawPid = readFileSync(PID_FILE, "utf-8").trim();
-						const pid = parseInt(rawPid);
-						process.kill(pid, "SIGTERM");
-						ctx.ui.notify(
-							`🛑 Sent stop signal to daemon (PID ${pid})`,
-							"info",
-						);
-					} catch {
-						ctx.ui.notify("Failed to stop daemon", "error");
+				case "stop": {
+					// Handle daemon mode first
+					if (isDaemonRunning()) {
+						try {
+							const rawPid = readFileSync(PID_FILE, "utf-8").trim();
+							const pid = parseInt(rawPid);
+							process.kill(pid, "SIGTERM");
+							ctx.ui.notify(
+								`🛑 Sent stop signal to daemon (PID ${pid})`,
+								"info",
+							);
+						} catch {
+							ctx.ui.notify("Failed to stop daemon", "error");
+						}
+						return;
 					}
+
+					if (!state.running) {
+						ctx.ui.notify("Gateway not running", "info");
+						return;
+					}
+
+					stopGatewayServer();
+					ctx.ui.notify("Gateway stopped", "info");
 					return;
 				}
-
-				if (!state.running) {
-					ctx.ui.notify("Gateway not running", "info");
-					return;
-				}
-
-				stopGatewayServer();
-				ctx.ui.notify("Gateway stopped", "info");
-				return;
-			}
 
 				case "restart": {
 					if (state.running) {
@@ -1055,56 +1054,54 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 
-			case "status": {
-				const lines: string[] = [];
+				case "status": {
+					const lines: string[] = [];
 
-				// Show daemon status if detached mode
-				const daemonAlive = isDaemonRunning();
-				if (daemonAlive) {
-					try {
-						const rawPid = readFileSync(PID_FILE, "utf-8").trim();
-						lines.push(
-							`Daemon: 🟢 Running (PID ${rawPid})`,
-						);
-					} catch {
-						lines.push("Daemon: 🟢 Running");
+					// Show daemon status if detached mode
+					const daemonAlive = isDaemonRunning();
+					if (daemonAlive) {
+						try {
+							const rawPid = readFileSync(PID_FILE, "utf-8").trim();
+							lines.push(`Daemon: 🟢 Running (PID ${rawPid})`);
+						} catch {
+							lines.push("Daemon: 🟢 Running");
+						}
+						lines.push("");
 					}
-					lines.push("");
-				}
 
-				lines.push(
-					`Mode: ${daemonAlive ? "Detached" : state.running ? "🟢 Inline" : "🔴 Stopped"}`,
-				);
-				lines.push(`Port: ${config.port}`);
-				lines.push(`Adapters: ${state.adapters.size}`);
-				lines.push(`Clients: ${state.clients.size}`);
-				lines.push(`Sessions: ${state.sessions.size}`);
-				lines.push(
-					`Agent: ${rpcProcess ? "✅ Connected" : "❌ Disconnected"}`,
-				);
-				lines.push("");
-				lines.push(`Session Reset: ${config.sessions.resetPolicy}`);
-				lines.push(`  - Daily at ${config.sessions.dailyHour}:00`);
-				lines.push(`  - Idle after ${config.sessions.idleMinutes} min`);
-				lines.push("");
-				const adminCount =
-					listAdmins().length +
-					Object.values(config.security.adminUids ?? {}).reduce(
-						(sum, uids) => sum + uids.length,
-						0,
+					lines.push(
+						`Mode: ${daemonAlive ? "Detached" : state.running ? "🟢 Inline" : "🔴 Stopped"}`,
 					);
-				lines.push(
-					`Security: ${config.security.allowAll ? "Allow all" : "Allowlist only"}${Object.values(config.security.allowedUids ?? {}).reduce((sum, uids) => sum + uids.length, 0) > 0 ? ` (+${Object.values(config.security.allowedUids ?? {}).reduce((sum, uids) => sum + uids.length, 0)} config UIDs)` : ""}`,
-				);
-				lines.push(`Admins: ${adminCount}`);
+					lines.push(`Port: ${config.port}`);
+					lines.push(`Adapters: ${state.adapters.size}`);
+					lines.push(`Clients: ${state.clients.size}`);
+					lines.push(`Sessions: ${state.sessions.size}`);
+					lines.push(
+						`Agent: ${rpcProcess ? "✅ Connected" : "❌ Disconnected"}`,
+					);
+					lines.push("");
+					lines.push(`Session Reset: ${config.sessions.resetPolicy}`);
+					lines.push(`  - Daily at ${config.sessions.dailyHour}:00`);
+					lines.push(`  - Idle after ${config.sessions.idleMinutes} min`);
+					lines.push("");
+					const adminCount =
+						listAdmins().length +
+						Object.values(config.security.adminUids ?? {}).reduce(
+							(sum, uids) => sum + uids.length,
+							0,
+						);
+					lines.push(
+						`Security: ${config.security.allowAll ? "Allow all" : "Allowlist only"}${Object.values(config.security.allowedUids ?? {}).reduce((sum, uids) => sum + uids.length, 0) > 0 ? ` (+${Object.values(config.security.allowedUids ?? {}).reduce((sum, uids) => sum + uids.length, 0)} config UIDs)` : ""}`,
+					);
+					lines.push(`Admins: ${adminCount}`);
 
-				ctx.ui.setWidget("gateway-status", lines, {
-					placement: "belowEditor",
-				});
-				setTimeout(
-					() => ctx.ui.setWidget("gateway-status", undefined),
-					15000,
-				);
+					ctx.ui.setWidget("gateway-status", lines, {
+						placement: "belowEditor",
+					});
+					setTimeout(
+						() => ctx.ui.setWidget("gateway-status", undefined),
+						15000,
+					);
 					return;
 				}
 
@@ -1779,9 +1776,7 @@ async function detachAndRun(): Promise<void> {
 		// Non-fatal
 	}
 
-	logger.info(
-		`[pi-gateway] Daemon started (PID ${process.pid})`,
-	);
+	logger.info(`[pi-gateway] Daemon started (PID ${process.pid})`);
 
 	// Init
 	config = loadConfig();
@@ -1828,9 +1823,7 @@ async function startGatewayServer(port: number): Promise<void> {
 
 	await new Promise<void>((resolve, reject) => {
 		server!.listen(port, config.host, () => {
-			logger.info(
-				`[gateway] HTTP server started on ${config.host}:${port}`,
-			);
+			logger.info(`[gateway] HTTP server started on ${config.host}:${port}`);
 			resolve();
 		});
 		server!.on("error", reject);

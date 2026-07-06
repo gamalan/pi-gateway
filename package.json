@@ -1,6 +1,6 @@
 {
   "name": "@gamalan/pi-gateway",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Hermes-style messaging gateway for pi - multi-platform agent with sessions, security, and background tasks",
   "author": "0xKobold <original>; forked by gamalan",
   "license": "MIT",
@@ -30,6 +30,9 @@
     "config/",
     "README.md"
   ],
+  "bin": {
+    "pi-gateway": "./dist/cli.js"
+  },
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
