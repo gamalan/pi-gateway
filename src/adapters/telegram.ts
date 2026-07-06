@@ -108,7 +108,7 @@ export class TelegramAdapter extends BaseAdapter {
 			signal: AbortSignal.timeout(35_000), // slightly above Telegram's 30s long-poll
 			headers: {
 				"Content-Type": "application/json",
-				"Connection": "close", // prevent stale undici connections
+				Connection: "close", // prevent stale undici connections
 				...options.headers,
 			},
 		});
