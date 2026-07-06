@@ -326,10 +326,7 @@ function createRpcProcess(): any {
 					broadcastClients("event", msg);
 				}
 			} catch {
-				logger.debug(
-					"[gateway] Failed to parse RPC line:",
-					line.slice(0, 200),
-				);
+				logger.debug("[gateway] Failed to parse RPC line:", line.slice(0, 200));
 			}
 		}
 	});
@@ -507,7 +504,8 @@ const adapterCallbacks: AdapterCallbacks = {
 			let sentId: string | undefined;
 			if (adapter) {
 				try {
-					sentId = await adapter.sendMessage(message.channelId, "▌");
+					await adapter.setTyping(message.channelId, true);
+					sentId = await adapter.sendMessage(message.channelId, "🤔");
 				} catch {
 					// If sendMessage itself fails, don't even try to process
 					logger.error("[gateway] Failed to send initial placeholder message");
@@ -549,6 +547,7 @@ const adapterCallbacks: AdapterCallbacks = {
 					} else {
 						await adapter.sendMessage(message.channelId, responseText);
 					}
+					await adapter.setTyping(message.channelId, false);
 					logger.info("[gateway] Response sent to platform successfully");
 				} else if (!responseText && adapter) {
 					logger.warn("[gateway] Response text was empty — nothing to send");
@@ -564,6 +563,7 @@ const adapterCallbacks: AdapterCallbacks = {
 							"I processed your message but had no text response. Please try again.",
 						);
 					}
+					await adapter.setTyping(message.channelId, false);
 				}
 			} catch (err) {
 				logger.error("[gateway] RPC error processing message:", err);
@@ -576,6 +576,7 @@ const adapterCallbacks: AdapterCallbacks = {
 						} else {
 							await adapter.sendMessage(message.channelId, errorMsg);
 						}
+						await adapter.setTyping(message.channelId, false);
 					} catch (sendErr) {
 						logger.error("[gateway] Failed to send error message:", sendErr);
 					}
