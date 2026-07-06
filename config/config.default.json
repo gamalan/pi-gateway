@@ -1,0 +1,51 @@
+{
+  "port": 3847,
+  "host": "localhost",
+  "tokens": [],
+  "corsOrigins": ["*"],
+  "enableWebSocket": true,
+  "enableHttp": true,
+  "security": {
+    "allowAll": true,
+    "requirePairing": false,
+    "allowedUids": {},
+    "adminUids": {},
+    "rateLimit": {
+      "maxRequests": 60,
+      "windowMs": 60000
+    }
+  },
+  "sessions": {
+    "resetPolicy": "idle",
+    "dailyHour": 4,
+    "idleMinutes": 1440
+  },
+  "platforms": {
+    "discord": {
+      "enabled": false,
+      "botToken": "",
+      "guildId": ""
+    },
+    "twitch": {
+      "enabled": false,
+      "clientId": "",
+      "clientSecret": "",
+      "channels": []
+    },
+    "telegram": {
+      "enabled": false,
+      "token": "",
+      "webhookUrl": ""
+    },
+    "slack": {
+      "enabled": false,
+      "webhookUrl": "",
+      "botToken": ""
+    },
+    "whatsapp": {
+      "enabled": false,
+      "sessionPath": "~/.pi/whatsapp-session",
+      "printQr": true
+    }
+  }
+}

@@ -11,9 +11,10 @@
 import Database from "better-sqlite3";
 import { join } from "path";
 import { homedir } from "os";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync } from "fs";
 import { randomBytes } from "node:crypto";
 import { logger } from "../logger.js";
+import { GATEWAY_CONFIG_FILE } from "../paths.js";
 
 export type Platform =
 	| "discord"
@@ -29,6 +30,13 @@ export type Platform =
 
 interface AllowlistEntry {
 	platform: Platform;
+	userId: string;
+	addedAt: number;
+	note?: string;
+}
+
+interface AdminEntry {
+	platform: Platform | "*";
 	userId: string;
 	addedAt: number;
 	note?: string;
@@ -104,6 +112,20 @@ export function initSecurityStore(): Database.Database {
       window_start INTEGER NOT NULL
     )
   `);
+
+	// Admin table
+	db.exec(`
+    CREATE TABLE IF NOT EXISTS admins (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      platform TEXT NOT NULL DEFAULT '*',
+      user_id TEXT NOT NULL,
+      added_at INTEGER NOT NULL,
+      note TEXT
+    )
+  `);
+	db.exec(
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_admins ON admins(platform, user_id)`,
+	);
 
 	logger.info("[Security] Database initialized");
 	return db;
@@ -336,38 +358,101 @@ export function cleanupExpiredCodes(): number {
 	return result.changes;
 }
 
-// Security configuration
-interface SecurityConfig {
+// Shared with index.ts — reads from the single gateway config file.
+// Schema: the `security` block inside ~/.pi/gateway/config.json
+export interface SecurityConfig {
 	allowAll: boolean;
 	requirePairing: boolean;
 	allowedUids: Record<string, string[]>;
+	adminUids: Record<string, string[]>;
 	rateLimit: {
 		maxRequests: number;
 		windowMs: number;
 	};
 }
 
-const CONFIG_FILE = join(GATEWAY_DIR, "gateway-security.json");
-
 function getSecurityConfig(): SecurityConfig {
 	try {
-		if (existsSync(CONFIG_FILE)) {
-			const content = readFileSync(CONFIG_FILE, "utf-8");
-			return JSON.parse(content);
+		if (existsSync(GATEWAY_CONFIG_FILE)) {
+			const raw = JSON.parse(readFileSync(GATEWAY_CONFIG_FILE, "utf-8"));
+			if (raw.security) return raw.security as SecurityConfig;
 		}
-	} catch {
-		// Ignore
+	} catch (err) {
+		logger.error(
+			"[Security] Failed to parse config — using defaults. Error:",
+			err,
+		);
 	}
 	return {
 		allowAll: false,
 		requirePairing: false,
 		allowedUids: {},
+		adminUids: {},
 		rateLimit: { maxRequests: 60, windowMs: 60000 },
 	};
 }
 
-export function setSecurityConfig(config: Partial<SecurityConfig>): void {
-	const current = getSecurityConfig();
-	const updated = { ...current, ...config };
-	writeFileSync(CONFIG_FILE, JSON.stringify(updated, null, 2), "utf-8");
+// ── Admin Role Management ─────────────────────────────────────────
+
+/**
+ * Check if a user has admin privileges.
+ * Looks at both DB admins table and config adminUids.
+ */
+export function isAdmin(platform: Platform | string, userId: string): boolean {
+	const database = initSecurityStore();
+	const config = getSecurityConfig();
+
+	// Check config-based adminUids (cross-platform wildcard or platform-specific)
+	if (config.adminUids) {
+		const platformUids = config.adminUids[platform];
+		if (platformUids?.includes(userId)) return true;
+		const wildcardUids = config.adminUids["*"];
+		if (wildcardUids?.includes(userId)) return true;
+	}
+
+	// Check DB admins (platform-specific or wildcard)
+	const entry = database
+		.prepare(
+			`SELECT 1 FROM admins WHERE (platform = ? OR platform = '*') AND user_id = ?`,
+		)
+		.get(platform, userId);
+
+	return !!entry;
+}
+
+/** Add a user as admin. Platform "*" means admin on all platforms. */
+export function addAdmin(
+	platform: Platform | "*",
+	userId: string,
+	note?: string,
+): void {
+	const database = initSecurityStore();
+	database
+		.prepare(
+			`INSERT OR REPLACE INTO admins (platform, user_id, added_at, note)
+       VALUES (?, ?, ?, ?)`,
+		)
+		.run(platform, userId, Date.now(), note ?? null);
+	logger.info(`[Security] Admin added: ${platform}:${userId}`);
+}
+
+/** Remove admin privileges from a user. Returns true if removed. */
+export function removeAdmin(platform: Platform | "*", userId: string): boolean {
+	const database = initSecurityStore();
+	const result = database
+		.prepare("DELETE FROM admins WHERE platform = ? AND user_id = ?")
+		.run(platform, userId);
+	if (result.changes > 0) {
+		logger.info(`[Security] Admin removed: ${platform}:${userId}`);
+	}
+	return result.changes > 0;
+}
+
+/** List all admin entries. */
+export function listAdmins(): AdminEntry[] {
+	const database = initSecurityStore();
+	const rows = database
+		.prepare("SELECT * FROM admins ORDER BY platform, user_id")
+		.all() as AdminEntry[];
+	return rows;
 }

@@ -62,7 +62,12 @@ Configuration lives at `~/.pi/gateway/config.json`:
   "security": {
     "allowAll": true,              // false = enforce allowlist
     "requirePairing": false,
-    "allowedUids": {}              // pre-approved users (see Security)
+    "allowedUids": {},             // pre-approved users (see Security)
+    "adminUids": {},              // users with full access (see Admin Users)
+    "rateLimit": {
+      "maxRequests": 60,
+      "windowMs": 60000
+    }
   },
   "sessions": {
     "resetPolicy": "idle",         // "daily" | "idle" | "both"
@@ -84,8 +89,7 @@ Configuration lives at `~/.pi/gateway/config.json`:
     "telegram": {
       "enabled": true,
       "token": "your-bot-token",
-      "mode": "polling",           // or "webhook"
-      "webhookUrl": "https://..."
+      "webhookUrl": "https://..."  // omit for long polling
     },
     "slack": {
       "enabled": true,
@@ -100,6 +104,22 @@ Configuration lives at `~/.pi/gateway/config.json`:
   }
 }
 ```
+
+When the gateway starts for the first time with no config file, it
+automatically seeds `~/.pi/gateway/config.json` from the default
+template shipped with the package.  You can also find it at
+`node_modules/pi-gateway/config/config.default.json`.
+
+### Telegram: webhook vs long polling
+
+The gateway auto-detects the mode based on whether `webhookUrl` is set:
+
+| `webhookUrl` | Mode | How it works |
+|---|---|---|
+| Set | **Webhook** | Telegram POSTs updates to `/webhook/telegram` on the gateway's HTTP server. Lowest latency, requires a public URL. |
+| Omitted | **Long polling** | The gateway opens a persistent connection to Telegram's `getUpdates` endpoint (30s timeout). Telegram holds it open and returns immediately when a message arrives — near-real-time, no public URL needed. |
+
+Both modes are real-time. Long polling is NOT interval-based — it keeps one connection alive at all times.
 
 ## Security
 
@@ -119,19 +139,25 @@ Manage users at runtime via `/gateway` commands:
 
 ### Config-file pre-approved UIDs
 
-Skip pairing entirely by listing UIDs in `~/.pi/gateway-security.json`:
+Skip pairing entirely by listing UIDs in the `security` block of `config.json`:
 
 ```jsonc
 {
-  "allowAll": false,
-  "allowedUids": {
-    "discord": ["123456789", "987654321"],
-    "telegram": ["1234567890"],
-    "*": ["cross-platform-admin"]
-  },
-  "rateLimit": {
-    "maxRequests": 60,
-    "windowMs": 60000
+  "security": {
+    "allowAll": false,
+    "allowedUids": {
+      "discord": ["123456789", "987654321"],
+      "telegram": ["1234567890"],
+      "*": ["cross-platform-admin"]
+    },
+    "adminUids": {
+      "discord": ["123456789"],
+      "*": ["cross-platform-admin-uid"]
+    },
+    "rateLimit": {
+      "maxRequests": 60,
+      "windowMs": 60000
+    }
   }
 }
 ```
@@ -139,6 +165,86 @@ Skip pairing entirely by listing UIDs in `~/.pi/gateway-security.json`:
 - Platform-specific keys match that platform only
 - The `"*"` wildcard matches any platform
 - Users in this list are auto-allowed on first contact — no pairing code needed
+- `adminUids` grants full unrestricted access (bypasses all tool policies)
+- All security settings live in the main `config.json` — no separate security file
+
+### Admin Users
+
+Admin users have **full unrestricted access** — they bypass all tool policies and can use every tool pi offers (bash, write, edit, subagent, etc.).
+
+Admins can be set at runtime or via config's `security.adminUids` block:
+
+```jsonc
+{
+  "security": {
+    "adminUids": {
+      "discord": ["123456789"],
+      "*": ["cross-platform-admin-uid"]
+    }
+  }
+}
+```
+
+```bash
+# List all admins (DB + config)
+/gateway admin list
+
+# Grant admin to a user on a specific platform
+/gateway admin add discord 123456789
+
+# Grant admin on ALL platforms
+/gateway admin add * 123456789
+
+# Revoke admin
+/gateway admin remove discord 123456789
+```
+
+Admin users are listed in the status panel and their messages carry a "FULL ACCESS" guard.
+
+### Tool Policy
+
+By default, external users are **restricted to read-only tools** when their messages reach pi: they can search code, inspect files, and ask questions, but cannot write files, execute shell commands, spawn subagents, or modify system state.
+
+The policy is enforced via a system directive prepended to every forwarded message. It is tunable per platform, per user, or globally.
+
+**Default allowed tools:** `read`, `web_search`, `fetch_content`, `fffind`, `ffgrep`, `module_report`, `read_symbol`, code search tools, `lsp_diagnostics`, `lsp_navigation`, `image_generate`, `gateway_*`
+
+**Default denied tools:** `bash`, `write`, `edit`, `subagent`, `todo`, `goal_complete`, `mcp`, `ast_grep_replace`, `agent_browser`, `ask_user_question`, `wait`, `intercom`, `wiki_*`, `lens_diagnostics`
+
+#### Managing Policies
+
+```bash
+# List all explicit policies
+/gateway tool-policy list
+
+# See the default baseline
+/gateway tool-policy defaults
+
+# Allow bash for a specific user
+/gateway tool-policy set discord U123456 bash allow
+
+# Deny write for all users on Discord
+/gateway tool-policy set discord * write deny
+
+# Allow everything for an admin user (glob)
+/gateway tool-policy set * admin-uid * allow
+
+# Remove a policy by ID
+/gateway tool-policy remove 3
+
+# Reset all custom policies to defaults
+/gateway tool-policy reset
+```
+
+Policies can also be managed from within pi sessions via the `gateway_tool_policy` tool.
+
+**Resolution order** (highest wins): user-specific > platform-specific > global. Ties break deny-first (secure by default). The `*` glob matches any tool name. Admin users always bypass all restrictions.
+
+> **Note:** All security configuration (allowlist, admin UIDs, rate limits)
+> lives in the `security` block of `~/.pi/gateway/config.json`. There is
+> no separate security config file. On first run, the gateway
+> auto-seeds a complete default config so you don't have to write one
+> from scratch.
 
 ### Pairing Flow
 
@@ -162,6 +268,17 @@ When `requirePairing` is enabled and a user is not in the allowlist:
 | `/gateway sessions` | List active chat sessions |
 | `/gateway tasks` | List background tasks |
 | `/gateway config` | Show current configuration |
+| `/gateway admin list` | List admin users (DB + config) |
+| `/gateway admin add <p\|*> <uid>` | Grant admin privileges |
+| `/gateway admin remove <p\|*> <uid>` | Revoke admin |
+| `/gateway admin list` | List admin users |
+| `/gateway admin add <p\|*> <uid>` | Grant admin privileges |
+| `/gateway admin remove <p\|*> <uid>` | Revoke admin |
+| `/gateway tool-policy list` | List explicit tool policies |
+| `/gateway tool-policy defaults` | Show default policy baseline |
+| `/gateway tool-policy set <p> <u> <t> allow\|deny` | Add/update a tool policy |
+| `/gateway tool-policy remove <id>` | Delete a policy |
+| `/gateway tool-policy reset` | Clear all, back to defaults |
 
 ## HTTP API
 
@@ -202,6 +319,7 @@ The extension registers these tools for use in pi sessions:
 - **`gateway_sessions`** — List active chat sessions
 - **`gateway_background_tasks`** — List and manage background tasks
 - **`gateway_pairing`** — Generate or approve pairing codes
+- **`gateway_tool_policy`** — Manage tool access policies for external users
 
 ## Sessions
 

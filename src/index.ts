@@ -15,9 +15,8 @@
  *   /gateway pair <code>    - Approve pairing code
  */
 
-import { homedir } from "node:os";
 import { join } from "node:path";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, copyFileSync, mkdirSync } from "node:fs";
 import {
 	createServer,
 	type IncomingMessage,
@@ -42,6 +41,11 @@ import {
 } from "./sessions/store.js";
 import { logger } from "./logger.js";
 import {
+	GATEWAY_CONFIG_DIR,
+	GATEWAY_CONFIG_FILE,
+	getPackageRoot,
+} from "./paths.js";
+import {
 	initSecurityStore,
 	isUserAllowed,
 	approvePairingCode,
@@ -50,8 +54,19 @@ import {
 	addToAllowlist,
 	listAllowlistedUsers,
 	revokeUserAccess,
+	addAdmin,
+	removeAdmin,
+	listAdmins,
 	type Platform,
 } from "./security/auth.js";
+import {
+	setToolPolicy,
+	removeToolPolicy,
+	listToolPolicies,
+	resetToolPolicies,
+	getEffectivePolicySummary,
+	buildPolicyGuard,
+} from "./security/tool-policy.js";
 import {
 	initBackgroundTasks,
 	startBackgroundTask,
@@ -70,10 +85,6 @@ import type {
 	PlatformMessage,
 } from "./adapters/base.js";
 
-const GATEWAY_DIR = join(homedir(), ".pi");
-const CONFIG_DIR = join(GATEWAY_DIR, "gateway");
-const CONFIG_FILE = join(CONFIG_DIR, "config.json");
-
 // Types
 interface GatewayConfig {
 	port: number;
@@ -86,6 +97,11 @@ interface GatewayConfig {
 		allowAll: boolean;
 		requirePairing: boolean;
 		allowedUids: Record<string, string[]>;
+		adminUids: Record<string, string[]>;
+		rateLimit: {
+			maxRequests: number;
+			windowMs: number;
+		};
 	};
 	sessions: {
 		resetPolicy: "daily" | "idle" | "both";
@@ -107,7 +123,8 @@ interface GatewayConfig {
 		telegram?: {
 			enabled: boolean;
 			token: string;
-			mode?: "polling" | "webhook";
+			/** Public URL for Telegram webhook (e.g. https://example.com/webhook/telegram).
+			 *  When omitted, long polling is used automatically. */
 			webhookUrl?: string;
 		};
 		slack?: {
@@ -141,6 +158,8 @@ const DEFAULT_CONFIG: GatewayConfig = {
 		allowAll: true,
 		requirePairing: false,
 		allowedUids: {},
+		adminUids: {},
+		rateLimit: { maxRequests: 60, windowMs: 60000 },
 	},
 	sessions: {
 		resetPolicy: "idle",
@@ -166,17 +185,47 @@ interface PendingRequest {
 }
 const pendingRequests: PendingRequest[] = [];
 
+// Pending prompt completions — resolve when agent_end arrives with response text
+interface PendingCompletion {
+	resolve: (text: string) => void;
+	reject: (err: Error) => void;
+	timer: ReturnType<typeof setTimeout>;
+}
+const pendingCompletions: PendingCompletion[] = [];
+
 // Load/save config
 function loadConfig(): GatewayConfig {
 	try {
-		if (existsSync(CONFIG_FILE)) {
+		if (existsSync(GATEWAY_CONFIG_FILE)) {
 			return {
 				...DEFAULT_CONFIG,
-				...JSON.parse(readFileSync(CONFIG_FILE, "utf-8")),
+				...JSON.parse(readFileSync(GATEWAY_CONFIG_FILE, "utf-8")),
 			};
 		}
-	} catch {
-		/* ignore */
+
+		// No config file yet — seed from default template
+		const packageRoot = getPackageRoot(import.meta.url);
+		const defaultConfigPath = join(
+			packageRoot,
+			"config",
+			"config.default.json",
+		);
+		if (existsSync(defaultConfigPath)) {
+			if (!existsSync(GATEWAY_CONFIG_DIR)) {
+				mkdirSync(GATEWAY_CONFIG_DIR, { recursive: true });
+			}
+			copyFileSync(defaultConfigPath, GATEWAY_CONFIG_FILE);
+			logger.info("[gateway] Seeded default config at", GATEWAY_CONFIG_FILE);
+			return {
+				...DEFAULT_CONFIG,
+				...JSON.parse(readFileSync(GATEWAY_CONFIG_FILE, "utf-8")),
+			};
+		}
+	} catch (err) {
+		logger.error(
+			"[gateway] Failed to parse config file — using defaults. Error:",
+			err,
+		);
 	}
 	return { ...DEFAULT_CONFIG };
 }
@@ -231,6 +280,19 @@ function createRpcProcess(): any {
 					}
 				}
 
+				// agent_end carries the full response — resolve pending completions
+				if (msg.type === "agent_end") {
+					const text = extractAgentEndText(msg);
+					logger.info(
+						`[gateway] agent_end received, text length: ${text.length}`,
+					);
+					const completion = pendingCompletions.shift();
+					if (completion) {
+						clearTimeout(completion.timer);
+						completion.resolve(text);
+					}
+				}
+
 				// Broadcast events
 				if (msg.type === "response") {
 					broadcastClients("response", msg);
@@ -249,6 +311,12 @@ function createRpcProcess(): any {
 
 	proc.on("exit", (code: number) => {
 		logger.info("[gateway] pi process exited");
+		// Reject any pending completions so they don't hang forever
+		while (pendingCompletions.length > 0) {
+			const completion = pendingCompletions.shift()!;
+			clearTimeout(completion.timer);
+			completion.reject(new Error(`pi process exited with code ${code}`));
+		}
 		rpcProcess = null;
 		broadcastClients("agent_disconnected", { code });
 	});
@@ -286,6 +354,81 @@ async function sendRpc(
 	});
 }
 
+// Extract assistant response text from agent_end.messages
+function extractAgentEndText(agentEndMsg: Record<string, unknown>): string {
+	const messages = agentEndMsg.messages as
+		| Array<Record<string, unknown>>
+		| undefined;
+	if (!messages) return "";
+
+	const parts: string[] = [];
+	for (const msg of messages) {
+		if (msg.role === "assistant") {
+			const content = msg.content;
+			if (Array.isArray(content)) {
+				for (const block of content as Array<Record<string, unknown>>) {
+					if (block.type === "text" && typeof block.text === "string") {
+						parts.push(block.text as string);
+					}
+				}
+			}
+		}
+	}
+	return parts.join("\n");
+}
+
+// Send a prompt to pi and wait for agent_end to get the full response text.
+// Unlike sendRpc (which resolves with the ACK), this resolves with the
+// actual assistant response text after the agent finishes processing.
+async function sendPromptRpc(message: string): Promise<string> {
+	if (!rpcProcess) throw new Error("pi agent not running");
+
+	// Send the prompt and wait for the ACK (so we know the prompt was accepted)
+	const ackResponse = await sendRpc("prompt", { message });
+	const ack = ackResponse as Record<string, unknown>;
+	if (!ack.success) {
+		throw new Error(`Prompt rejected: ${JSON.stringify(ackResponse)}`);
+	}
+
+	logger.info("[gateway] Prompt ACK received, waiting for agent_end...");
+
+	// Wait for agent_end to deliver the full response
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => {
+			const idx = pendingCompletions.findIndex((c) => c.timer === timer);
+			if (idx !== -1) pendingCompletions.splice(idx, 1);
+			reject(
+				new Error(
+					"Prompt completion timeout — no agent_end received within 5 minutes",
+				),
+			);
+		}, 300000); // 5 minutes
+
+		pendingCompletions.push({ resolve, reject, timer });
+	});
+}
+
+// Extract response text from pi RPC response (kept for backward compat with old sendRpc)
+// pi responds with JSON lines on stdout;
+// the response shape varies but typically contains `text` or `content`
+function extractRpcResponseText(response: unknown): string {
+	if (typeof response === "string") return response;
+	const r = response as Record<string, unknown>;
+	if (r.text && typeof r.text === "string") return r.text;
+	if (r.content) {
+		// OpenAI-style content array: [{ type: "text", text: "..." }]
+		if (Array.isArray(r.content)) {
+			return (r.content as Array<Record<string, unknown>>)
+				.filter((c) => c.type === "text" && typeof c.text === "string")
+				.map((c) => c.text as string)
+				.join("\n");
+		}
+		if (typeof r.content === "string") return r.content;
+	}
+	// Fallback — the response might be something we don't recognise
+	return "";
+}
+
 // Platform adapter callbacks
 const adapterCallbacks: AdapterCallbacks = {
 	onMessage: async (message: PlatformMessage) => {
@@ -311,12 +454,56 @@ const adapterCallbacks: AdapterCallbacks = {
 		// Store session reference
 		state.sessions.set(`${message.platform}:${message.channelId}`, session);
 
-		// Send to pi agent
+		// Send to pi agent with tool policy guard
 		if (rpcProcess) {
-			await sendRpc("prompt", {
-				message: message.content,
-				sessionId: session.id,
-			});
+			const guard = buildPolicyGuard(message.platform, message.userId);
+			try {
+				logger.info(
+					`[gateway] Sending prompt from ${message.platform}/${message.userId} (session: ${session.id.slice(0, 12)}...)`,
+				);
+
+				// Use sendPromptRpc which waits for agent_end (the real response),
+				// NOT the ACK which has no content
+				const responseText = await sendPromptRpc(
+					`${guard}\n\n${message.content}`,
+				);
+
+				logger.info(
+					`[gateway] Response received, length: ${responseText.length}, sending back to ${message.platform}/${message.channelId}`,
+				);
+
+				if (responseText) {
+					const adapter = state.adapters.get(message.platform);
+					if (adapter) {
+						await adapter.sendMessage(message.channelId, responseText);
+						logger.info("[gateway] Response sent to platform successfully");
+					}
+				} else {
+					logger.warn("[gateway] Response text was empty — nothing to send");
+					const adapter = state.adapters.get(message.platform);
+					if (adapter) {
+						await adapter.sendMessage(
+							message.channelId,
+							"I processed your message but had no text response. Please try again.",
+						);
+					}
+				}
+			} catch (err) {
+				logger.error("[gateway] RPC error processing message:", err);
+				const adapter = state.adapters.get(message.platform);
+				if (adapter) {
+					try {
+						await adapter.sendMessage(
+							message.channelId,
+							"Sorry, I encountered an error processing your message. Please try again.",
+						);
+					} catch (sendErr) {
+						logger.error("[gateway] Failed to send error message:", sendErr);
+					}
+				}
+			}
+		} else {
+			logger.warn("[gateway] pi agent not running — cannot process message");
 		}
 	},
 	onDisconnect: () => {
@@ -375,7 +562,6 @@ async function initializeAdapters(): Promise<void> {
 				enabled: true,
 				platform: "telegram",
 				token: config.platforms.telegram.token,
-				mode: config.platforms.telegram.mode,
 				webhookUrl: config.platforms.telegram.webhookUrl,
 			});
 			await telegram.initialize();
@@ -480,13 +666,36 @@ async function handleHttpRequest(
 		return;
 	}
 
+	// ── Telegram webhook (unauthenticated — called by Telegram) ──
+	const url = new URL(req.url || "/", `http://${req.headers.host}`);
+	if (url.pathname === "/webhook/telegram" && req.method === "POST") {
+		const chunks: Buffer[] = [];
+		req.on("data", (chunk: Buffer) => chunks.push(chunk));
+		req.on("end", async () => {
+			try {
+				const body = JSON.parse(Buffer.concat(chunks).toString());
+				const telegram = state.adapters.get("telegram") as any;
+				if (telegram?.handleWebhookUpdate) {
+					await telegram.handleWebhookUpdate(body);
+					res.writeHead(200);
+					res.end("ok");
+				} else {
+					res.writeHead(503);
+					res.end("Telegram adapter not running");
+				}
+			} catch {
+				res.writeHead(400);
+				res.end("Invalid request");
+			}
+		});
+		return;
+	}
+
 	if (!authenticate(req)) {
 		res.writeHead(401);
 		res.end(JSON.stringify({ error: "Unauthorized" }));
 		return;
 	}
-
-	const url = new URL(req.url || "/", `http://${req.headers.host}`);
 
 	// API endpoints
 	if (url.pathname === "/api/status" && req.method === "GET") {
@@ -622,9 +831,11 @@ export default function (pi: ExtensionAPI) {
 				"pair",
 				"allow",
 				"revoke",
+				"admin",
 				"sessions",
 				"tasks",
 				"config",
+				"tool-policy",
 			];
 			return cmds
 				.filter((c) => c.startsWith(prefix))
@@ -641,6 +852,9 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 
+					// Reload config fresh on every start so users can edit
+					// ~/.pi/gateway/config.json without restarting pi
+					config = loadConfig();
 					const port = parseInt(parts[1]) || config.port;
 
 					// Start HTTP server
@@ -717,6 +931,55 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 
+				case "restart": {
+					if (state.running) {
+						// Stop
+						for (const adapter of state.adapters.values()) {
+							await adapter.stop();
+						}
+						state.adapters.clear();
+						stopCron();
+						for (const ws of state.clients.values()) {
+							ws.close(1000, "Server restart");
+						}
+						state.clients.clear();
+						server?.close();
+						server = null;
+						wss = null;
+						if (rpcProcess) {
+							rpcProcess.kill();
+							rpcProcess = null;
+						}
+						state.running = false;
+					}
+
+					// Reload config and start
+					config = loadConfig();
+					const port = parseInt(parts[1]) || config.port;
+					server = createServer(handleHttpRequest);
+					if (config.enableWebSocket) {
+						wss = new WebSocketServer({ server });
+						wss.on("connection", handleWebSocket);
+					}
+					server.listen(port, config.host, () => {
+						logger.info(
+							`[gateway] HTTP server started on ${config.host}:${port}`,
+						);
+					});
+					rpcProcess = createRpcProcess();
+					await initializeAdapters();
+					startCron();
+					state.running = true;
+					updateStatus();
+					ctx.ui.notify(
+						`✅ Gateway restarted on http://${config.host}:${port}\n\n` +
+							`Platforms: ${state.adapters.size > 0 ? Array.from(state.adapters.keys()).join(", ") : "none"}\n` +
+							`Sessions: Idle reset every ${config.sessions.idleMinutes} min`,
+						"info",
+					);
+					return;
+				}
+
 				case "status": {
 					const lines: string[] = [];
 					lines.push(`Status: ${state.running ? "🟢 Running" : "🔴 Stopped"}`);
@@ -732,9 +995,16 @@ export default function (pi: ExtensionAPI) {
 					lines.push(`  - Daily at ${config.sessions.dailyHour}:00`);
 					lines.push(`  - Idle after ${config.sessions.idleMinutes} min`);
 					lines.push("");
+					const adminCount =
+						listAdmins().length +
+						Object.values(config.security.adminUids ?? {}).reduce(
+							(sum, uids) => sum + uids.length,
+							0,
+						);
 					lines.push(
 						`Security: ${config.security.allowAll ? "Allow all" : "Allowlist only"}${Object.values(config.security.allowedUids ?? {}).reduce((sum, uids) => sum + uids.length, 0) > 0 ? ` (+${Object.values(config.security.allowedUids ?? {}).reduce((sum, uids) => sum + uids.length, 0)} config UIDs)` : ""}`,
 					);
+					lines.push(`Admins: ${adminCount}`);
 
 					ctx.ui.setWidget("gateway-status", lines, {
 						placement: "belowEditor",
@@ -825,6 +1095,84 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 
+				case "admin": {
+					const action = parts[1]?.toLowerCase();
+
+					switch (action) {
+						case "list": {
+							const dbAdmins = listAdmins();
+							const configAdmins = config.security.adminUids ?? {};
+							const configLines: string[] = [];
+							for (const [plat, uids] of Object.entries(configAdmins)) {
+								for (const uid of uids) {
+									configLines.push(`${plat}:${uid} (config)`);
+								}
+							}
+							const dbLines = dbAdmins.map((a) => `${a.platform}:${a.userId}`);
+							ctx.ui.notify(
+								"Admin users:\n" +
+									([...dbLines, ...configLines].length > 0
+										? [...dbLines, ...configLines].join("\n")
+										: "None"),
+								"info",
+							);
+							return;
+						}
+
+						case "add": {
+							const plat = parts[2];
+							const uid = parts[3];
+							if (!plat || !uid) {
+								ctx.ui.notify(
+									"Usage: /gateway admin add <platform|*> <userId>\n" +
+										"Use * for platform to make admin on all platforms.\n" +
+										"Admins bypass all tool restrictions and have full access.",
+									"info",
+								);
+								return;
+							}
+							addAdmin(plat as Platform | "*", uid);
+							ctx.ui.notify(
+								`✅ ${uid} is now admin on ${plat === "*" ? "all platforms" : plat}`,
+								"info",
+							);
+							return;
+						}
+
+						case "remove": {
+							const plat = parts[2];
+							const uid = parts[3];
+							if (!plat || !uid) {
+								ctx.ui.notify(
+									"Usage: /gateway admin remove <platform|*> <userId>",
+									"info",
+								);
+								return;
+							}
+							if (removeAdmin(plat as Platform | "*", uid)) {
+								ctx.ui.notify(`Removed admin: ${plat}:${uid}`, "info");
+							} else {
+								ctx.ui.notify(`${uid} was not an admin on ${plat}`, "error");
+							}
+							return;
+						}
+
+						default: {
+							ctx.ui.notify(
+								"/gateway admin commands:\n\n" +
+									"  list                  - Show all admins (DB + config)\n" +
+									"  add <platform|*> <uid>  - Grant admin privileges\n" +
+									"  remove <platform|*> <uid> - Revoke admin privileges\n\n" +
+									"Admins bypass all tool restrictions and have full access.\n" +
+									"Use * as platform to grant admin on all platforms.\n" +
+									"Config-file admins: set adminUids in gateway-security.json",
+								"info",
+							);
+						}
+					}
+					return;
+				}
+
 				case "sessions": {
 					const sessions = listSessions();
 					ctx.ui.notify(
@@ -873,6 +1221,122 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 
+				case "tool-policy": {
+					const action = parts[1]?.toLowerCase();
+
+					switch (action) {
+						case "list": {
+							const platform = parts[2];
+							const userId = parts[3];
+							const policies = listToolPolicies(platform, userId);
+							if (policies.length === 0) {
+								ctx.ui.notify(
+									"No explicit tool policies — only defaults active.\n" +
+										"Use /gateway tool-policy defaults to see them.",
+									"info",
+								);
+								return;
+							}
+							ctx.ui.notify(
+								"Tool policies:\n" +
+									policies
+										.map(
+											(p) =>
+												`#${p.id} ${p.platform ?? "*"}:${p.userId ?? "*"} → ${p.toolName} [${p.action}]`,
+										)
+										.join("\n"),
+								"info",
+							);
+							return;
+						}
+
+						case "defaults": {
+							const summary = getEffectivePolicySummary("*", "*");
+							ctx.ui.notify(
+								"Default Tool Policy (all external users):\n\n" +
+									`✅ ALLOWED:\n  ${summary.allowed.join("\n  ")}\n\n` +
+									`🚫 DENIED:\n  ${summary.denied.join("\n  ")}\n\n` +
+									"Use /gateway tool-policy set to override.",
+								"info",
+							);
+							return;
+						}
+
+						case "set": {
+							const plat = parts[2] || null;
+							const uid = parts[3] || null;
+							const tool = parts[4];
+							const act = parts[5]?.toLowerCase();
+
+							if (!tool || (act !== "allow" && act !== "deny")) {
+								ctx.ui.notify(
+									"Usage: /gateway tool-policy set [platform] [userId] <toolName> allow|deny\n\n" +
+										"Examples:\n" +
+										"  /gateway tool-policy set discord * bash deny\n" +
+										"  /gateway tool-policy set discord U123 bash allow\n" +
+										"  /gateway tool-policy set * * write allow\n" +
+										"  (Use * for platform/userId to mean all)",
+									"info",
+								);
+								return;
+							}
+
+							setToolPolicy({
+								platform: plat === "*" ? null : plat,
+								userId: uid === "*" ? null : uid,
+								toolName: tool,
+								action: act as "allow" | "deny",
+								priority: 50, // Explicit policies override default (priority 0)
+							});
+
+							ctx.ui.notify(
+								`Policy set: ${plat ?? "*"}:${uid ?? "*"} → ${tool} [${act}]`,
+								"info",
+							);
+							return;
+						}
+
+						case "remove": {
+							const id = parseInt(parts[2]);
+							if (isNaN(id)) {
+								ctx.ui.notify(
+									"Usage: /gateway tool-policy remove <id>\n" +
+										"Use /gateway tool-policy list to see IDs.",
+									"info",
+								);
+								return;
+							}
+							if (removeToolPolicy(id)) {
+								ctx.ui.notify(`Removed tool policy #${id}`, "info");
+							} else {
+								ctx.ui.notify(`Policy #${id} not found`, "error");
+							}
+							return;
+						}
+
+						case "reset": {
+							resetToolPolicies();
+							ctx.ui.notify("All tool policies reset to defaults.", "info");
+							return;
+						}
+
+						default: {
+							ctx.ui.notify(
+								"/gateway tool-policy commands:\n\n" +
+									"  list [platform] [userId]  - List explicit policies\n" +
+									"  defaults                   - Show default policy\n" +
+									"  set <p> <u> <tool> allow|deny - Add/update policy\n" +
+									"  remove <id>                - Delete a policy\n" +
+									"  reset                      - Clear all, back to defaults\n\n" +
+									"Use * for platform/userId to match all.\n" +
+									"Tool names support globs: bash, gateway_*, wiki_*",
+								"info",
+							);
+						}
+					}
+					return;
+				}
+
 				default: {
 					ctx.ui.notify(
 						"pi Gateway Commands:\n\n" +
@@ -883,14 +1347,19 @@ export default function (pi: ExtensionAPI) {
 							"  /gateway pair <code>  - Approve pairing\n" +
 							"  /gateway allow <p> <u>- Add user to allowlist\n" +
 							"  /gateway revoke <p> <u>- Remove user from allowlist\n" +
+							"  /gateway admin list   - List admin users\n" +
+							"  /gateway admin add <p|*> <u> - Grant admin\n" +
+							"  /gateway admin remove <p|*> <u> - Revoke admin\n" +
 							"  /gateway sessions     - List sessions\n" +
 							"  /gateway tasks        - List background tasks\n" +
-							"  /gateway config       - Show config\n\n" +
+							"  /gateway config       - Show config\n" +
+							"  /gateway tool-policy  - Manage tool policies\n\n" +
 							"Hermes-style features:\n" +
 							"  - Per-chat sessions with reset policies\n" +
 							"  - Platform adapters (Discord, etc.)\n" +
 							"  - Background task support\n" +
-							"  - Allowlist security (DB + config UIDs)",
+							"  - Allowlist security (DB + config UIDs)\n" +
+							"  - Tool policy (per-user tool allow/deny)",
 						"info",
 					);
 				}
@@ -1054,6 +1523,132 @@ export default function (pi: ExtensionAPI) {
 							},
 						],
 						details: { count: pending.length },
+					};
+				}
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "gateway_tool_policy",
+		label: "Gateway Tool Policy",
+		description: "Manage tool access policies for external gateway users",
+		parameters: Type.Object({
+			action: Type.Union([
+				Type.Literal("list"),
+				Type.Literal("defaults"),
+				Type.Literal("set"),
+				Type.Literal("remove"),
+				Type.Literal("reset"),
+			]),
+			platform: Type.Optional(Type.String()),
+			userId: Type.Optional(Type.String()),
+			toolName: Type.Optional(Type.String()),
+			policyAction: Type.Optional(
+				Type.Union([Type.Literal("allow"), Type.Literal("deny")]),
+			),
+			policyId: Type.Optional(Type.Number()),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			const { action, platform, userId, toolName, policyAction, policyId } =
+				params;
+
+			switch (action) {
+				case "list": {
+					const policies = listToolPolicies(platform, userId);
+					return {
+						content: [
+							{
+								type: "text",
+								text:
+									policies.length > 0
+										? JSON.stringify(policies, null, 2)
+										: "No explicit policies — only defaults active.",
+							},
+						],
+						details: { count: policies.length, policies },
+					};
+				}
+
+				case "defaults": {
+					const summary = getEffectivePolicySummary(
+						platform ?? "*",
+						userId ?? "*",
+					);
+					return {
+						content: [
+							{
+								type: "text",
+								text:
+									`Default tool policy:\n\n` +
+									`ALLOWED: ${summary.allowed.join(", ")}\n` +
+									`DENIED: ${summary.denied.join(", ")}`,
+							},
+						],
+						details: summary,
+					};
+				}
+
+				case "set": {
+					if (!toolName || !policyAction) {
+						return {
+							content: [
+								{
+									type: "text",
+									text: "toolName and policyAction (allow|deny) are required",
+								},
+							],
+							details: { error: true },
+						};
+					}
+					setToolPolicy({
+						platform: platform ?? null,
+						userId: userId ?? null,
+						toolName,
+						action: policyAction,
+						priority: 50,
+					});
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Policy set: ${platform ?? "*"}:${userId ?? "*"} → ${toolName} [${policyAction}]`,
+							},
+						],
+						details: { success: true },
+					};
+				}
+
+				case "remove": {
+					if (policyId == null) {
+						return {
+							content: [
+								{ type: "text", text: "policyId (number) is required" },
+							],
+							details: { error: true },
+						};
+					}
+					const removed = removeToolPolicy(policyId);
+					return {
+						content: [
+							{
+								type: "text",
+								text: removed
+									? `Removed policy #${policyId}`
+									: `Policy #${policyId} not found`,
+							},
+						],
+						details: { success: removed },
+					};
+				}
+
+				case "reset": {
+					resetToolPolicies();
+					return {
+						content: [
+							{ type: "text", text: "All tool policies reset to defaults." },
+						],
+						details: { success: true },
 					};
 				}
 			}
