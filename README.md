@@ -21,12 +21,6 @@ Install from npm (recommended):
 pi install npm:@gamalan/pi-gateway
 ```
 
-Or install directly from GitHub:
-
-```bash
-pi install git:github.com/gamalan/pi-gateway
-```
-
 Or clone and build manually:
 
 ```bash
