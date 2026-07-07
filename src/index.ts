@@ -431,6 +431,9 @@ function createRpcProcess(): any {
 			clearTimeout(completion.timer);
 			completion.reject(new Error(`pi process exited with code ${code}`));
 		}
+		// Clean up any pending interactive UI requests
+		cleanupPendingUiRequests();
+		setActiveChannel(null);
 		rpcProcess = null;
 		broadcastClients("agent_disconnected", { code });
 	});
