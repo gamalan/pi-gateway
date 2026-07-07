@@ -93,9 +93,7 @@ export async function handleExtensionUiRequest(
 	adapter: BaseAdapter,
 ): Promise<void> {
 	if (!activeChannel) {
-		logger.warn(
-			"[interactive] No active channel — cannot route UI request",
-		);
+		logger.warn("[interactive] No active channel — cannot route UI request");
 		return;
 	}
 
@@ -150,9 +148,7 @@ export async function handleExtensionUiRequest(
  * If requestId is empty, looks up the most recent pending request
  * for the active channel (used for ForceReply responses on Telegram).
  */
-export function handleInteractiveResponse(
-	response: InteractiveResponse,
-): void {
+export function handleInteractiveResponse(response: InteractiveResponse): void {
 	let pending = response.requestId
 		? pendingUiRequests.get(response.requestId)
 		: undefined;

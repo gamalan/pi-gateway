@@ -341,39 +341,37 @@ function createRpcProcess(): any {
 					}
 				}
 
-			// agent_end carries the full response — resolve pending completions
-			if (msg.type === "agent_end") {
-				const text = extractAgentEndText(msg);
-				logger.info(
-					`[gateway] agent_end received, text length: ${text.length}`,
-				);
-				const completion = pendingCompletions.shift();
-				if (completion) {
-					clearTimeout(completion.timer);
-					completion.resolve(text);
+				// agent_end carries the full response — resolve pending completions
+				if (msg.type === "agent_end") {
+					const text = extractAgentEndText(msg);
+					logger.info(
+						`[gateway] agent_end received, text length: ${text.length}`,
+					);
+					const completion = pendingCompletions.shift();
+					if (completion) {
+						clearTimeout(completion.timer);
+						completion.resolve(text);
+					}
+					// Clean up any pending interactive prompts
+					cleanupPendingUiRequests();
+					setActiveChannel(null);
 				}
-				// Clean up any pending interactive prompts
-				cleanupPendingUiRequests();
-				setActiveChannel(null);
-			}
 
-			// Handle extension UI requests (select, confirm, input, etc.)
-			if (msg.type === "extension_ui_request") {
-				const active = getActiveChannel();
-				if (active) {
-					const adapter = state.adapters.get(active.platform);
-					if (adapter) {
-						handleExtensionUiRequest(msg, adapter).catch(
-							(err) => {
+				// Handle extension UI requests (select, confirm, input, etc.)
+				if (msg.type === "extension_ui_request") {
+					const active = getActiveChannel();
+					if (active) {
+						const adapter = state.adapters.get(active.platform);
+						if (adapter) {
+							handleExtensionUiRequest(msg, adapter).catch((err) => {
 								logger.error(
 									"[gateway] Failed to handle extension UI request:",
 									err,
 								);
-							},
-						);
+							});
+						}
 					}
 				}
-			}
 
 				// Stream text deltas to active completion
 				if (
@@ -909,11 +907,11 @@ const adapterCallbacks: AdapterCallbacks = {
 		} else {
 			logger.warn("[gateway] pi agent not running — cannot process message");
 		}
-},
-onInteractiveResponse: (response: InteractiveResponse) => {
+	},
+	onInteractiveResponse: (response: InteractiveResponse) => {
 		handleInteractiveResponse(response);
-},
-onDisconnect: () => {
+	},
+	onDisconnect: () => {
 		logger.info("[gateway] Platform adapter disconnected");
 		updateStatus();
 	},

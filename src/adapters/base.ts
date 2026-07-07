@@ -113,10 +113,7 @@ export interface PlatformAdapter {
 	 * Clean up interactive elements from a message (remove buttons, etc.).
 	 * Optional — only needed if the platform can't auto-expire interactions.
 	 */
-	cleanupInteractive?(
-		channelId: string,
-		messageId: string,
-	): Promise<void>;
+	cleanupInteractive?(channelId: string, messageId: string): Promise<void>;
 }
 
 /**
@@ -194,9 +191,7 @@ function formatGenericPrompt(prompt: InteractivePrompt): string {
 	switch (prompt.method) {
 		case "select": {
 			const options = prompt.options || [];
-			const numbered = options
-				.map((opt, i) => `${i + 1}. ${opt}`)
-				.join("\n");
+			const numbered = options.map((opt, i) => `${i + 1}. ${opt}`).join("\n");
 			return `**${prompt.title}**\n\n${numbered}\n\n_Reply with the number of your choice._`;
 		}
 		case "confirm": {
@@ -205,9 +200,7 @@ function formatGenericPrompt(prompt: InteractivePrompt): string {
 		}
 		case "input":
 		case "editor": {
-			const hint = prompt.placeholder
-				? `\n\n_(${prompt.placeholder})_`
-				: "";
+			const hint = prompt.placeholder ? `\n\n_(${prompt.placeholder})_` : "";
 			const pre = prompt.prefill
 				? `\n\n\`\`\`\n${prompt.prefill}\n\`\`\`\n\n_Reply with your ${prompt.method === "editor" ? "changes" : "input"}._`
 				: `\n\n_Reply with your ${prompt.method === "editor" ? "text" : "input"}._`;

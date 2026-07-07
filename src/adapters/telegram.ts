@@ -414,11 +414,7 @@ export class TelegramAdapter extends BaseAdapter {
 						{ text: "❌ No", data: `ui:${prompt.requestId}:0` },
 					],
 				];
-				const messageId = await this.sendButtons(
-					channelId,
-					text,
-					buttons,
-				);
+				const messageId = await this.sendButtons(channelId, text, buttons);
 				return { messageId };
 			}
 			case "input":
