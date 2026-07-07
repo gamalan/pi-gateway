@@ -3,7 +3,7 @@
  * pi-gateway CLI — standalone terminal commands for managing the gateway daemon.
  *
  * Usage:
- *   pi-gateway start -d     Start gateway as a detached daemon
+ *   pi-gateway start         Start gateway as a detached daemon
  *   pi-gateway stop          Stop the running daemon
  *   pi-gateway status        Show daemon status
  */
@@ -39,7 +39,7 @@ function printHelp(): void {
 pi-gateway — Hermes-style messaging gateway daemon
 
 Usage:
-  pi-gateway start -d     Start gateway as a detached daemon
+  pi-gateway start         Start gateway as a detached daemon
   pi-gateway stop          Stop the running daemon
   pi-gateway status        Show daemon status and health
   pi-gateway --help        Show this help
@@ -57,15 +57,6 @@ const cmd = process.argv[2];
 
 switch (cmd) {
 	case "start": {
-		const isDetached =
-			process.argv.includes("-d") || process.argv.includes("--detached");
-
-		if (!isDetached) {
-			console.log("Use 'pi-gateway start -d' to start as a detached daemon.");
-			console.log("Use '/gateway start' inside pi to run the gateway inline.");
-			process.exit(1);
-		}
-
 		const { running, pid } = isRunning();
 		if (running) {
 			console.log(`Gateway daemon is already running (PID ${pid}).`);
@@ -156,6 +147,20 @@ switch (cmd) {
 		}
 
 		console.log("Logs: ~/.pi/gateway/gateway.log");
+
+		// Show last 10 log lines
+		const logFile = join(homedir(), ".pi", "gateway", "gateway.log");
+		try {
+			const logContent = readFileSync(logFile, "utf-8");
+			const lines = logContent.trim().split("\n");
+			const last = lines.slice(-10);
+			console.log(`\nLast ${last.length} log lines:`);
+			for (const line of last) {
+				console.log(`  ${line}`);
+			}
+		} catch {
+			/* log file not available */
+		}
 		break;
 	}
 
