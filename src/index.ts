@@ -23,6 +23,7 @@ import {
 	mkdirSync,
 	writeFileSync,
 	unlinkSync,
+	watchFile,
 } from "node:fs";
 import {
 	createServer,
@@ -1757,6 +1758,39 @@ export default function (pi: ExtensionAPI) {
 // Daemon mode — run gateway as a standalone detached process
 // ═══════════════════════════════════════════════════════════
 
+/**
+ * Watch ~/.pi/gateway/config.json for changes and auto-reload.
+ * Allows editing allowedUids, adminUids, rate limits, etc.
+ * without restarting the daemon.
+ */
+function startConfigWatcher(): void {
+	if (!existsSync(GATEWAY_CONFIG_FILE)) return;
+
+	watchFile(GATEWAY_CONFIG_FILE, (_curr, _prev) => {
+		try {
+			const raw = JSON.parse(
+				readFileSync(GATEWAY_CONFIG_FILE, "utf-8"),
+			);
+			// Merge into config — keeps existing settings for keys not in file
+			config = { ...DEFAULT_CONFIG, ...raw };
+			logger.info(
+				"[pi-gateway] Config reloaded from",
+				GATEWAY_CONFIG_FILE,
+			);
+		} catch (err) {
+			logger.error(
+				"[pi-gateway] Failed to reload config:",
+				err instanceof Error ? err.message : String(err),
+			);
+		}
+	});
+
+	logger.info(
+		"[pi-gateway] Watching config file for changes:",
+		GATEWAY_CONFIG_FILE,
+	);
+}
+
 const IS_DAEMON = process.argv.includes("--daemon");
 
 if (IS_DAEMON) {
@@ -1806,6 +1840,20 @@ async function detachAndRun(): Promise<void> {
 	};
 	process.on("SIGTERM", shutdown);
 	process.on("SIGINT", shutdown);
+
+	// ── Crash resilience ──
+	process.on("uncaughtException", (err) => {
+		logger.error(`[pi-gateway] UNCAUGHT EXCEPTION: ${err.stack || err.message}`);
+		process.exit(1);
+	});
+	process.on("unhandledRejection", (reason) => {
+		logger.error(
+			`[pi-gateway] UNHANDLED REJECTION: ${reason instanceof Error ? reason.stack || reason.message : String(reason)}`,
+		);
+	});
+
+	// ── Config file watcher — auto-reload when ~/.pi/gateway/config.json changes ──
+	startConfigWatcher();
 }
 
 async function startGatewayServer(port: number): Promise<void> {
