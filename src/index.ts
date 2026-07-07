@@ -1790,10 +1790,7 @@ function startConfigWatcher(): void {
 			// Valid — apply and update cache
 			config = { ...DEFAULT_CONFIG, ...parsed };
 			cachedConfig = config;
-			logger.info(
-				"[pi-gateway] Config reloaded from",
-				GATEWAY_CONFIG_FILE,
-			);
+			logger.info("[pi-gateway] Config reloaded from", GATEWAY_CONFIG_FILE);
 		} catch (err) {
 			logger.error(
 				"[pi-gateway] Invalid config — keeping previous valid config. Error:",
