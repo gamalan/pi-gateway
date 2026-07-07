@@ -12,6 +12,7 @@ import {
 	BaseAdapter,
 	type PlatformMessage,
 	type PlatformConfig,
+	type InteractivePrompt,
 } from "./base.js";
 import { logger } from "../logger.js";
 
@@ -186,6 +187,25 @@ export class TelegramAdapter extends BaseAdapter {
 		if (update.message || update.edited_message) {
 			const msg = update.message || update.edited_message;
 
+			// Check if this is a ForceReply response (reply to an interactive prompt)
+			if (
+				msg.reply_to_message?.reply_markup?.force_reply &&
+				this.callbacks?.onInteractiveResponse
+			) {
+				const content = msg.text || msg.caption || "";
+				if (content) {
+					// Generate a requestId — we don't have the original ID
+					// from the message text, so we use a correlation approach.
+					// The ForceReply message was sent for the current active prompt.
+					// We just forward it; interactive.ts will correlate.
+					this.callbacks.onInteractiveResponse({
+						requestId: "", // filled by interactive.ts via activeChannel
+						value: content,
+					});
+					return;
+				}
+			}
+
 			// Check if chat is allowed
 			if (
 				this.config.allowedChats &&
@@ -227,6 +247,26 @@ export class TelegramAdapter extends BaseAdapter {
 		// Handle callback queries (button presses)
 		if (update.callback_query) {
 			const query = update.callback_query;
+			const data: string = query.data || "";
+
+			// Route interactive UI callbacks (buttons from sendInteractive)
+			if (data.startsWith("ui:") && this.callbacks?.onInteractiveResponse) {
+				const parts = data.split(":");
+				const requestId = parts[1];
+				const rawValue = parts.slice(2).join(":"); // value may contain colons
+
+				this.callbacks.onInteractiveResponse({
+					requestId,
+					value: rawValue,
+				});
+
+				// Answer callback to dismiss loading spinner
+				await this.apiRequest("/answerCallbackQuery", {
+					method: "POST",
+					body: JSON.stringify({ callback_query_id: query.id }),
+				});
+				return;
+			}
 
 			const message: PlatformMessage = {
 				id: this.generateMessageId(),
@@ -344,6 +384,88 @@ export class TelegramAdapter extends BaseAdapter {
 		return String(data.result?.message_id || 0);
 	}
 
+	/** Send an interactive prompt with native Telegram UI. */
+	async sendInteractive(
+		channelId: string,
+		prompt: InteractivePrompt,
+	): Promise<{ messageId: string }> {
+		switch (prompt.method) {
+			case "select": {
+				const buttons = (prompt.options || []).map((opt, i) => [
+					{
+						text: opt,
+						data: `ui:${prompt.requestId}:${i}`,
+					},
+				]);
+				const messageId = await this.sendButtons(
+					channelId,
+					`<b>${escapeHtml(prompt.title)}</b>`,
+					buttons,
+				);
+				return { messageId };
+			}
+			case "confirm": {
+				const text = prompt.message
+					? `<b>${escapeHtml(prompt.title)}</b>\n\n<i>${escapeHtml(prompt.message)}</i>`
+					: `<b>${escapeHtml(prompt.title)}</b>`;
+				const buttons = [
+					[
+						{ text: "✅ Yes", data: `ui:${prompt.requestId}:1` },
+						{ text: "❌ No", data: `ui:${prompt.requestId}:0` },
+					],
+				];
+				const messageId = await this.sendButtons(
+					channelId,
+					text,
+					buttons,
+				);
+				return { messageId };
+			}
+			case "input":
+			case "editor": {
+				const hint = prompt.placeholder
+					? `\n<i>${escapeHtml(prompt.placeholder)}</i>`
+					: "";
+				const prefill = prompt.prefill
+					? `\n\n<pre>${escapeHtml(prompt.prefill)}</pre>`
+					: "";
+				const text =
+					`<b>${escapeHtml(prompt.title)}</b>${hint}${prefill}\n\n` +
+					`<i>Reply to this message with your ${prompt.method === "editor" ? "text" : "input"}.</i>`;
+				const response = await this.apiRequest("/sendMessage", {
+					method: "POST",
+					body: JSON.stringify({
+						chat_id: channelId,
+						text,
+						parse_mode: "HTML",
+						reply_markup: { force_reply: true },
+					}),
+				});
+				const data = (await response.json()) as {
+					ok: boolean;
+					result?: { message_id: number };
+				};
+				if (!data.ok) {
+					throw new Error(`Failed to send ForceReply: ${JSON.stringify(data)}`);
+				}
+				return { messageId: String(data.result?.message_id || 0) };
+			}
+			case "notify": {
+				const icon =
+					prompt.notifyType === "warning"
+						? "⚠️"
+						: prompt.notifyType === "error"
+							? "❌"
+							: "ℹ️";
+				const messageId = await this.sendMessage(
+					channelId,
+					`${icon} ${prompt.message || prompt.title}`,
+				);
+				return { messageId };
+			}
+		}
+	}
+
 	async editMessage(
 		channelId: string,
 		messageId: string,
@@ -401,4 +523,13 @@ export class TelegramAdapter extends BaseAdapter {
 		}
 		await this.handleUpdate(update);
 	}
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────┐
+
+function escapeHtml(text: string): string {
+	return text
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;");
 }

@@ -2,6 +2,30 @@
  * Platform Adapter Base - Interface for Hermes-style platform adapters
  */
 
+// ── Interactive UI types ──────────────────────────────────────────────────
+
+/** Platform-agnostic description of an interactive prompt from pi. */
+export interface InteractivePrompt {
+	requestId: string;
+	method: "select" | "confirm" | "input" | "editor" | "notify";
+	title: string;
+	message?: string;
+	options?: string[];
+	placeholder?: string;
+	prefill?: string;
+	notifyType?: "info" | "warning" | "error";
+}
+
+/** User's response to an interactive prompt. */
+export interface InteractiveResponse {
+	requestId: string;
+	value?: string;
+	confirmed?: boolean;
+	cancelled?: boolean;
+}
+
+// ── Message types ─────────────────────────────────────────────────────────
+
 export interface PlatformMessage {
 	id: string;
 	platform: string;
@@ -24,6 +48,8 @@ export interface AdapterCallbacks {
 	onMessage: (message: PlatformMessage) => Promise<void>;
 	onTyping?: (userId: string, isTyping: boolean) => void;
 	onDisconnect?: () => void;
+	/** Fired when a user responds to an interactive prompt (button click, reply). */
+	onInteractiveResponse?: (response: InteractiveResponse) => void;
 }
 
 export interface PlatformAdapter {
@@ -73,6 +99,24 @@ export interface PlatformAdapter {
 	 * Get adapter health status
 	 */
 	getStatus(): Promise<{ connected: boolean; latency?: number }>;
+
+	/**
+	 * Send an interactive prompt (select, confirm, input, etc.).
+	 * Returns the platform-specific message ID for potential cleanup.
+	 */
+	sendInteractive(
+		channelId: string,
+		prompt: InteractivePrompt,
+	): Promise<{ messageId: string }>;
+
+	/**
+	 * Clean up interactive elements from a message (remove buttons, etc.).
+	 * Optional — only needed if the platform can't auto-expire interactions.
+	 */
+	cleanupInteractive?(
+		channelId: string,
+		messageId: string,
+	): Promise<void>;
 }
 
 /**
@@ -98,6 +142,14 @@ export abstract class BaseAdapter implements PlatformAdapter {
 		this.callbacks = null;
 	}
 
+	/** Clean up interactive elements (remove buttons, etc.). No-op by default. */
+	async cleanupInteractive(
+		_channelId: string,
+		_messageId: string,
+	): Promise<void> {
+		// Default: nothing to clean up
+	}
+
 	abstract sendMessage(channelId: string, content: string): Promise<string>;
 	abstract editMessage(
 		channelId: string,
@@ -107,6 +159,19 @@ export abstract class BaseAdapter implements PlatformAdapter {
 	abstract deleteMessage(channelId: string, messageId: string): Promise<void>;
 	abstract setTyping(channelId: string, isTyping: boolean): Promise<void>;
 	abstract getStatus(): Promise<{ connected: boolean; latency?: number }>;
+
+	/**
+	 * Default interactive prompt — sends as text with instructions.
+	 * Override in platform-specific adapters for native interactive UI.
+	 */
+	async sendInteractive(
+		channelId: string,
+		prompt: InteractivePrompt,
+	): Promise<{ messageId: string }> {
+		const text = formatGenericPrompt(prompt);
+		const messageId = await this.sendMessage(channelId, text);
+		return { messageId };
+	}
 
 	protected emitMessage(message: PlatformMessage): Promise<void> {
 		if (this.callbacks?.onMessage) {
@@ -120,5 +185,42 @@ export abstract class BaseAdapter implements PlatformAdapter {
 
 	protected generateMessageId(): string {
 		return `${this.platform}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+	}
+}
+
+// ── Generic interactive prompt formatter (fallback for non-interactive platforms) ─┐
+
+function formatGenericPrompt(prompt: InteractivePrompt): string {
+	switch (prompt.method) {
+		case "select": {
+			const options = prompt.options || [];
+			const numbered = options
+				.map((opt, i) => `${i + 1}. ${opt}`)
+				.join("\n");
+			return `**${prompt.title}**\n\n${numbered}\n\n_Reply with the number of your choice._`;
+		}
+		case "confirm": {
+			const msg = prompt.message ? `\n\n_${prompt.message}_` : "";
+			return `**${prompt.title}**${msg}\n\n_Reply yes or no._`;
+		}
+		case "input":
+		case "editor": {
+			const hint = prompt.placeholder
+				? `\n\n_(${prompt.placeholder})_`
+				: "";
+			const pre = prompt.prefill
+				? `\n\n\`\`\`\n${prompt.prefill}\n\`\`\`\n\n_Reply with your ${prompt.method === "editor" ? "changes" : "input"}._`
+				: `\n\n_Reply with your ${prompt.method === "editor" ? "text" : "input"}._`;
+			return `**${prompt.title}**${hint}${pre}`;
+		}
+		case "notify": {
+			const icon =
+				prompt.notifyType === "warning"
+					? "⚠️"
+					: prompt.notifyType === "error"
+						? "❌"
+						: "ℹ️";
+			return `${icon} ${prompt.message || prompt.title}`;
+		}
 	}
 }
