@@ -23,6 +23,7 @@ import {
 	mkdirSync,
 	writeFileSync,
 	unlinkSync,
+	watchFile,
 } from "node:fs";
 import {
 	createServer,
@@ -1757,6 +1758,58 @@ export default function (pi: ExtensionAPI) {
 // Daemon mode — run gateway as a standalone detached process
 // ═══════════════════════════════════════════════════════════
 
+/**
+ * Watch ~/.pi/gateway/config.json for changes and auto-reload.
+ * Uses a cache: invalid configs are rejected (logged but not applied).
+ */
+function startConfigWatcher(): void {
+	if (!existsSync(GATEWAY_CONFIG_FILE)) return;
+
+	// Seed the cache with the current valid config
+	let cachedConfig = config;
+
+	watchFile(GATEWAY_CONFIG_FILE, (_curr, _prev) => {
+		try {
+			const raw = readFileSync(GATEWAY_CONFIG_FILE, "utf-8");
+			const parsed = JSON.parse(raw);
+
+			// Validate shape — must be a plain object with expected fields
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+				throw new Error("Config must be a JSON object, got " + typeof parsed);
+			}
+			if (parsed.port != null && typeof parsed.port !== "number") {
+				throw new Error("config.port must be a number");
+			}
+			if (parsed.security != null && typeof parsed.security !== "object") {
+				throw new Error("config.security must be an object");
+			}
+			if (parsed.sessions != null && typeof parsed.sessions !== "object") {
+				throw new Error("config.sessions must be an object");
+			}
+
+			// Valid — apply and update cache
+			config = { ...DEFAULT_CONFIG, ...parsed };
+			cachedConfig = config;
+			logger.info(
+				"[pi-gateway] Config reloaded from",
+				GATEWAY_CONFIG_FILE,
+			);
+		} catch (err) {
+			logger.error(
+				"[pi-gateway] Invalid config — keeping previous valid config. Error:",
+				err instanceof Error ? err.message : String(err),
+			);
+			// Restore known-good cache
+			config = cachedConfig;
+		}
+	});
+
+	logger.info(
+		"[pi-gateway] Watching config file for changes:",
+		GATEWAY_CONFIG_FILE,
+	);
+}
+
 const IS_DAEMON = process.argv.includes("--daemon");
 
 if (IS_DAEMON) {
@@ -1806,6 +1859,22 @@ async function detachAndRun(): Promise<void> {
 	};
 	process.on("SIGTERM", shutdown);
 	process.on("SIGINT", shutdown);
+
+	// ── Crash resilience ──
+	process.on("uncaughtException", (err) => {
+		logger.error(
+			`[pi-gateway] UNCAUGHT EXCEPTION: ${err.stack || err.message}`,
+		);
+		process.exit(1);
+	});
+	process.on("unhandledRejection", (reason) => {
+		logger.error(
+			`[pi-gateway] UNHANDLED REJECTION: ${reason instanceof Error ? reason.stack || reason.message : String(reason)}`,
+		);
+	});
+
+	// ── Config file watcher — auto-reload when ~/.pi/gateway/config.json changes ──
+	startConfigWatcher();
 }
 
 async function startGatewayServer(port: number): Promise<void> {
