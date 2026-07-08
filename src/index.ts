@@ -56,6 +56,7 @@ import {
 import {
 	initSecurityStore,
 	isUserAllowed,
+	isAdmin,
 	approvePairingCode,
 	generatePairingCode,
 	listPendingPairingCodes,
@@ -525,6 +526,107 @@ const adapterCallbacks: AdapterCallbacks = {
 
 		// Store session reference
 		state.sessions.set(`${message.platform}:${message.channelId}`, session);
+
+		// ── Admin model commands ──
+		const modelMatch = message.content.match(/^\/model\s+(.+)/i);
+		if (modelMatch && isAdmin(message.platform as Platform, message.userId)) {
+			const adapter = state.adapters.get(message.platform);
+			if (!rpcProcess) {
+				if (adapter) {
+					await adapter.sendMessage(
+						message.channelId,
+						"Agent not running — cannot change model.",
+					);
+				}
+				return;
+			}
+
+			const arg = modelMatch[1].trim().toLowerCase();
+
+			if (arg === "list") {
+				// List available models
+				try {
+					const result = (await sendRpc("get_available_models")) as {
+						success: boolean;
+						data?: { models: Array<{ provider: string; id: string; name: string }> };
+					};
+					if (result.success && result.data) {
+						const list = result.data.models
+							.map((m) => `• ${m.provider}/${m.id} — ${m.name}`)
+							.join("\n");
+						if (adapter) {
+							await adapter.sendMessage(
+								message.channelId,
+								`Available models:\n${list}\n\nUse \`/model provider/id\` to switch.`,
+							);
+						}
+					} else {
+						if (adapter) {
+							await adapter.sendMessage(
+								message.channelId,
+								"Could not retrieve model list.",
+							);
+						}
+					}
+				} catch (err) {
+					logger.error("[gateway] Failed to list models:", err);
+					if (adapter) {
+						await adapter.sendMessage(
+							message.channelId,
+							"Failed to retrieve model list.",
+						);
+					}
+				}
+				return;
+			}
+
+			// Set model: /model provider/modelId
+			const [provider, modelId] = arg.split("/");
+			if (!provider || !modelId) {
+				if (adapter) {
+					await adapter.sendMessage(
+						message.channelId,
+						"Usage: `/model provider/modelId` (e.g., `/model anthropic/claude-sonnet-4`)\n`/model list` to see available models.",
+					);
+				}
+				return;
+			}
+
+			try {
+				const result = (await sendRpc("set_model", {
+					provider,
+					modelId,
+				})) as { success: boolean; error?: string; data?: { name: string } };
+				if (result.success) {
+					const name = result.data?.name || `${provider}/${modelId}`;
+					if (adapter) {
+						await adapter.sendMessage(
+							message.channelId,
+							`✅ Model changed to ${name}`,
+						);
+					}
+					logger.info(
+						`[gateway] Admin ${message.userId} switched model to ${provider}/${modelId}`,
+					);
+				} else {
+					if (adapter) {
+						await adapter.sendMessage(
+							message.channelId,
+							`❌ Failed to set model: ${result.error || "unknown error"}`,
+						);
+					}
+				}
+			} catch (err) {
+				logger.error("[gateway] Failed to change model:", err);
+				if (adapter) {
+					await adapter.sendMessage(
+						message.channelId,
+						"Failed to change model — agent may not be responding.",
+					);
+				}
+			}
+			return;
+		}
 
 		// Send to pi agent with tool policy guard
 		if (rpcProcess) {
