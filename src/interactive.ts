@@ -86,6 +86,14 @@ export function setStreamRedirectHandler(fn: (() => void) | null): void {
 	streamRedirectHandler = fn;
 }
 
+/** Set by index.ts — called immediately when an extension_ui_request
+ * arrives on stdout, to flush full accumulated text into the placeholder
+ * before the user sees the interactive prompt. */
+export let flushHandler: (() => void) | null = null;
+export function setFlushHandler(fn: (() => void) | null): void {
+	flushHandler = fn;
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 export function setStdinWriter(fn: (line: string) => void): void {
