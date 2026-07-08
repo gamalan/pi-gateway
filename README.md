@@ -211,7 +211,7 @@ The policy is enforced via a system directive prepended to every forwarded messa
 
 **Default allowed tools:** `read`, `web_search`, `fetch_content`, `fffind`, `ffgrep`, `module_report`, `read_symbol`, code search tools, `lsp_diagnostics`, `lsp_navigation`, `image_generate`, `gateway_*`
 
-**Default denied tools:** `bash`, `write`, `edit`, `subagent`, `todo`, `goal_complete`, `mcp`, `ast_grep_replace`, `agent_browser`, `ask_user_question`, `wait`, `intercom`, `wiki_*`, `lens_diagnostics`
+**Default denied tools:** `bash`, `write`, `edit`, `subagent`, `todo`, `goal_complete`, `mcp`, `ast_grep_replace`, `agent_browser`, `wait`, `intercom`, `wiki_*`, `lens_diagnostics`
 
 #### Managing Policies
 

@@ -306,7 +306,7 @@ function broadcastClients(event: string, data: unknown): void {
 
 // RPC to pi agent
 function createRpcProcess(): any {
-	const proc = spawn("pi", ["--mode", "rpc"], {
+	const proc = spawn("pi", ["--mode", "rpc", "--extension", "dist/extensions/pi-gateway-ask-user-rpc.js"], {
 		stdio: ["pipe", "pipe", "pipe"],
 		env: {
 			...process.env,
@@ -567,9 +567,7 @@ const adapterCallbacks: AdapterCallbacks = {
 
 		// ── Admin/allowed model commands ──
 		const modelMatch = message.content.match(/^\/model(?:\s+(.+))?/i);
-		const modelCallback = message.content.match(
-			/^Callback:\s*model:(.+)/i,
-		);
+		const modelCallback = message.content.match(/^Callback:\s*model:(.+)/i);
 
 		if (
 			(modelMatch || modelCallback) &&
@@ -578,10 +576,7 @@ const adapterCallbacks: AdapterCallbacks = {
 			const adapter = state.adapters.get(message.platform);
 			if (!rpcProcess) {
 				if (adapter) {
-					await adapter.sendMessage(
-						message.channelId,
-						"Agent not running.",
-					);
+					await adapter.sendMessage(message.channelId, "Agent not running.");
 				}
 				return;
 			}
@@ -593,9 +588,7 @@ const adapterCallbacks: AdapterCallbacks = {
 				if (!provider || !modelId) return;
 
 				// Only admins can actually switch models
-				if (
-					!isAdmin(message.platform as Platform, message.userId)
-				) {
+				if (!isAdmin(message.platform as Platform, message.userId)) {
 					if (adapter) {
 						await adapter.sendMessage(
 							message.channelId,
@@ -615,8 +608,7 @@ const adapterCallbacks: AdapterCallbacks = {
 						data?: { name: string };
 					};
 					if (result.success) {
-						const name =
-							result.data?.name || `${provider}/${modelId}`;
+						const name = result.data?.name || `${provider}/${modelId}`;
 						if (adapter) {
 							await adapter.sendMessage(
 								message.channelId,
@@ -663,9 +655,7 @@ const adapterCallbacks: AdapterCallbacks = {
 							sendButtons?: (
 								ch: string,
 								text: string,
-								btns: Array<
-									Array<{ text: string; data: string }>
-								>,
+								btns: Array<Array<{ text: string; data: string }>>,
 							) => Promise<string>;
 						};
 						if (telegram?.sendButtons) {
@@ -683,10 +673,7 @@ const adapterCallbacks: AdapterCallbacks = {
 						} else if (adapter) {
 							// Text fallback
 							const list = models
-								.map(
-									(m) =>
-										`• ${m.provider}/${m.id} — ${m.name}`,
-								)
+								.map((m) => `• ${m.provider}/${m.id} — ${m.name}`)
 								.join("\n");
 							await adapter.sendMessage(
 								message.channelId,
@@ -712,9 +699,7 @@ const adapterCallbacks: AdapterCallbacks = {
 			}
 
 			// /model provider/modelId — only admins can switch
-			if (
-				!isAdmin(message.platform as Platform, message.userId)
-			) {
+			if (!isAdmin(message.platform as Platform, message.userId)) {
 				if (adapter) {
 					await adapter.sendMessage(
 						message.channelId,
@@ -774,40 +759,38 @@ const adapterCallbacks: AdapterCallbacks = {
 		// ── Admin restart command ──
 		if (/^\/restart$/i.test(message.content.trim())) {
 			if (!isAdmin(message.platform as Platform, message.userId)) {
-						// Non-admin: let pi handle it as a normal prompt
+				// Non-admin: let pi handle it as a normal prompt
 			} else {
-						const adapter = state.adapters.get(message.platform);
-						if (adapter) {
-								await adapter.sendMessage(
-										message.channelId,
-										"♻️ Restarting pi agent…",
-								);
-						}
+				const adapter = state.adapters.get(message.platform);
+				if (adapter) {
+					await adapter.sendMessage(
+						message.channelId,
+						"♻️ Restarting pi agent…",
+					);
+				}
 
-						// Kill and restart the pi RPC process
-						if (rpcProcess) {
-								rpcProcess.kill();
-								rpcProcess = null;
-						}
-						// Reject any pending completions
-						while (pendingCompletions.length > 0) {
-								const c = pendingCompletions.shift()!;
-								clearTimeout(c.timer);
-								c.reject(new Error("Agent restarted by admin"));
-						}
-						rpcProcess = createRpcProcess();
+				// Kill and restart the pi RPC process
+				if (rpcProcess) {
+					rpcProcess.kill();
+					rpcProcess = null;
+				}
+				// Reject any pending completions
+				while (pendingCompletions.length > 0) {
+					const c = pendingCompletions.shift()!;
+					clearTimeout(c.timer);
+					c.reject(new Error("Agent restarted by admin"));
+				}
+				rpcProcess = createRpcProcess();
 
-						logger.info(
-								`[gateway] Admin ${message.userId} restarted pi agent`,
-						);
+				logger.info(`[gateway] Admin ${message.userId} restarted pi agent`);
 
-						if (adapter) {
-								await adapter.sendMessage(
-										message.channelId,
-										"✅ Pi agent restarted.",
-								);
-						}
-						return;
+				if (adapter) {
+					await adapter.sendMessage(
+						message.channelId,
+						"✅ Pi agent restarted.",
+					);
+				}
+				return;
 			}
 		}
 
@@ -821,7 +804,7 @@ const adapterCallbacks: AdapterCallbacks = {
 			if (adapter) {
 				try {
 					await adapter.setTyping(message.channelId, true);
-					sentId = await adapter.sendMessage(message.channelId, "🤔");
+					sentId = await adapter.sendMessage(message.channelId, "⏳ Thinking…");
 				} catch {
 					// If sendMessage itself fails, don't even try to process
 					logger.error("[gateway] Failed to send initial placeholder message");

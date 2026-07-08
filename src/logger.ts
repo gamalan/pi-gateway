@@ -19,7 +19,16 @@ function ensureLogDir(): void {
 }
 
 function formatTimestamp(): string {
-	return new Date().toISOString();
+	const d = new Date();
+	const pad = (n: number, len = 2) => String(n).padStart(len, "0");
+	const yyyy = d.getFullYear();
+	const MM = pad(d.getMonth() + 1);
+	const dd = pad(d.getDate());
+	const HH = pad(d.getHours());
+	const mm = pad(d.getMinutes());
+	const ss = pad(d.getSeconds());
+	const ms = pad(d.getMilliseconds(), 3);
+	return `${yyyy}-${MM}-${dd}T${HH}:${mm}:${ss}.${ms}`;
 }
 
 function serializeArg(a: unknown): string {

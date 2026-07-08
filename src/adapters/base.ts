@@ -7,7 +7,16 @@
 /** Platform-agnostic description of an interactive prompt from pi. */
 export interface InteractivePrompt {
 	requestId: string;
-	method: "select" | "confirm" | "input" | "editor" | "notify";
+	method:
+		| "select"
+		| "confirm"
+		| "input"
+		| "editor"
+		| "notify"
+		| "setStatus"
+		| "setWidget"
+		| "setTitle"
+		| "set_editor_text";
 	title: string;
 	message?: string;
 	options?: string[];
@@ -166,6 +175,10 @@ export abstract class BaseAdapter implements PlatformAdapter {
 		prompt: InteractivePrompt,
 	): Promise<{ messageId: string }> {
 		const text = formatGenericPrompt(prompt);
+		// Skip empty notifications (e.g. widget/status clears with no content)
+		if (!text) {
+			return { messageId: "0" };
+		}
 		const messageId = await this.sendMessage(channelId, text);
 		return { messageId };
 	}
@@ -206,14 +219,29 @@ function formatGenericPrompt(prompt: InteractivePrompt): string {
 				: `\n\n_Reply with your ${prompt.method === "editor" ? "text" : "input"}._`;
 			return `**${prompt.title}**${hint}${pre}`;
 		}
-		case "notify": {
+		case "notify":
+		case "setStatus":
+		case "setWidget":
+		case "setTitle":
+		case "set_editor_text": {
+			const text = prompt.message || prompt.title;
+			// Skip if pi clears a widget/status with no content (e.g. setWidget(name, undefined))
+			if (!text) {
+				return "";
+			}
 			const icon =
 				prompt.notifyType === "warning"
 					? "⚠️"
 					: prompt.notifyType === "error"
 						? "❌"
 						: "ℹ️";
-			return `${icon} ${prompt.message || prompt.title}`;
+			return `${icon} ${text}`;
+		}
+		default: {
+			console.warn(
+				`[base] Unknown interactive method "${prompt.method}", falling back to plain text`,
+			);
+			return `**${prompt.title}**${prompt.message ? `\n\n_${prompt.message}_` : ""}\n\n_Reply with your response._`;
 		}
 	}
 }

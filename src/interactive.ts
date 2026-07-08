@@ -17,7 +17,16 @@ import { logger } from "./logger.js";
 export interface InteractiveUiRequest {
 	type: "extension_ui_request";
 	id: string;
-	method: "select" | "confirm" | "input" | "editor" | "notify";
+	method:
+		| "select"
+		| "confirm"
+		| "input"
+		| "editor"
+		| "notify"
+		| "setStatus"
+		| "setWidget"
+		| "setTitle"
+		| "set_editor_text";
 	title: string;
 	message?: string;
 	options?: string[];
@@ -60,6 +69,7 @@ interface PendingUiRequest {
 	channelId: string;
 	messageId: string;
 	adapter: BaseAdapter;
+	options?: string[];
 }
 
 const pendingUiRequests = new Map<string, PendingUiRequest>();
@@ -69,6 +79,12 @@ let activeChannel: ActiveChannel | null = null;
 
 /** Callback to write to pi's stdin. Set by index.ts */
 let writeToStdin: ((line: string) => void) | null = null;
+
+/** Set by index.ts — called after a select/confirm response is sent to pi */
+export let streamRedirectHandler: (() => void) | null = null;
+export function setStreamRedirectHandler(fn: (() => void) | null): void {
+	streamRedirectHandler = fn;
+}
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -108,12 +124,19 @@ export async function handleExtensionUiRequest(
 		notifyType: msg.notifyType,
 	};
 
-	if (msg.method === "notify") {
-		// Fire-and-forget — don't track for response
+	// Fire-and-forget methods — display but don't track for response
+	const fireAndForget = new Set([
+		"notify",
+		"setStatus",
+		"setWidget",
+		"setTitle",
+		"set_editor_text",
+	]);
+	if (fireAndForget.has(msg.method)) {
 		try {
 			await adapter.sendInteractive(activeChannel.channelId, prompt);
 		} catch (err) {
-			logger.error("[interactive] Failed to send notify:", err);
+			logger.error(`[interactive] Failed to send ${msg.method}:`, err);
 		}
 		return;
 	}
@@ -124,12 +147,20 @@ export async function handleExtensionUiRequest(
 			activeChannel.channelId,
 			prompt,
 		);
+		if (!result?.messageId) {
+			logger.error(
+				`[interactive] sendInteractive returned no messageId for ${msg.method} — auto-cancelling`,
+			);
+			sendUiResponse(msg.id, { requestId: msg.id, cancelled: true });
+			return;
+		}
 		pendingUiRequests.set(msg.id, {
 			requestId: msg.id,
 			platform: activeChannel.platform,
 			channelId: activeChannel.channelId,
 			messageId: result.messageId,
 			adapter,
+			options: msg.options,
 		});
 		logger.info(
 			`[interactive] Sent ${msg.method} prompt ${msg.id.slice(0, 8)}… to ${activeChannel.platform}/${activeChannel.channelId}`,
@@ -179,8 +210,25 @@ export function handleInteractiveResponse(response: InteractiveResponse): void {
 		`[interactive] Response for ${response.requestId.slice(0, 8)}…: ${response.value ?? (response.confirmed ? "confirmed" : "?")}${response.cancelled ? " (cancelled)" : ""}`,
 	);
 
+	// Resolve index-based select responses back to option text
+	// (telegram uses indices in callback_data to stay under the 64-byte limit)
+	if (response.value !== undefined && pending.options) {
+		const idx = parseInt(response.value, 10);
+		if (!isNaN(idx) && idx >= 0 && idx < pending.options.length) {
+			response.value = pending.options[idx];
+		}
+	}
+
 	pendingUiRequests.delete(response.requestId);
 	sendUiResponse(response.requestId, response);
+
+	// Redirect subsequent streaming to a new message after select/confirm
+	if (
+		streamRedirectHandler &&
+		(response.value !== undefined || response.confirmed !== undefined)
+	) {
+		streamRedirectHandler();
+	}
 }
 
 /**
