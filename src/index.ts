@@ -92,7 +92,19 @@ import type {
 	BaseAdapter,
 	AdapterCallbacks,
 	PlatformMessage,
+	InteractiveResponse,
 } from "./adapters/base.js";
+import {
+	handleExtensionUiRequest,
+	handleInteractiveResponse,
+	setStdinWriter,
+	setActiveChannel,
+	getActiveChannel,
+	setStreamRedirectHandler,
+	setFlushHandler,
+	flushHandler,
+	cleanupPendingUiRequests,
+} from "./interactive.js";
 
 // Types
 interface GatewayConfig {
@@ -297,12 +309,28 @@ function broadcastClients(event: string, data: unknown): void {
 
 // RPC to pi agent
 function createRpcProcess(): any {
-	const proc = spawn("pi", ["--mode", "rpc"], {
-		stdio: ["pipe", "pipe", "pipe"],
-		env: {
-			...process.env,
-			OLLAMA_HOST: process.env.OLLAMA_HOST || "localhost:11434",
+	const proc = spawn(
+		"pi",
+		[
+			"--mode",
+			"rpc",
+			"--extension",
+			"dist/extensions/pi-gateway-ask-user-rpc.js",
+		],
+		{
+			stdio: ["pipe", "pipe", "pipe"],
+			env: {
+				...process.env,
+				OLLAMA_HOST: process.env.OLLAMA_HOST || "localhost:11434",
+			},
 		},
+	);
+
+	// Give the interactive bridge a way to write to pi's stdin
+	setStdinWriter((line: string) => {
+		if (proc.stdin?.writable) {
+			proc.stdin.write(line);
+		}
 	});
 
 	let lineBuffer = "";
@@ -335,6 +363,27 @@ function createRpcProcess(): any {
 					if (completion) {
 						clearTimeout(completion.timer);
 						completion.resolve(text);
+					}
+					// Clean up any pending interactive prompts
+					cleanupPendingUiRequests();
+					setActiveChannel(null);
+				}
+
+				// Handle extension UI requests (select, confirm, input, etc.)
+				if (msg.type === "extension_ui_request") {
+					const active = getActiveChannel();
+					if (active) {
+						const adapter = state.adapters.get(active.platform);
+						if (adapter) {
+							// Flush full accumulated text into the placeholder NOW
+							flushHandler?.();
+							handleExtensionUiRequest(msg, adapter).catch((err) => {
+								logger.error(
+									"[gateway] Failed to handle extension UI request:",
+									err,
+								);
+							});
+						}
 					}
 				}
 
@@ -394,6 +443,9 @@ function createRpcProcess(): any {
 			clearTimeout(completion.timer);
 			completion.reject(new Error(`pi process exited with code ${code}`));
 		}
+		// Clean up any pending interactive UI requests
+		cleanupPendingUiRequests();
+		setActiveChannel(null);
 		rpcProcess = null;
 		broadcastClients("agent_disconnected", { code });
 	});
@@ -529,9 +581,7 @@ const adapterCallbacks: AdapterCallbacks = {
 
 		// ── Admin/allowed model commands ──
 		const modelMatch = message.content.match(/^\/model(?:\s+(.+))?/i);
-		const modelCallback = message.content.match(
-			/^Callback:\s*model:(.+)/i,
-		);
+		const modelCallback = message.content.match(/^Callback:\s*model:(.+)/i);
 
 		if (
 			(modelMatch || modelCallback) &&
@@ -540,10 +590,7 @@ const adapterCallbacks: AdapterCallbacks = {
 			const adapter = state.adapters.get(message.platform);
 			if (!rpcProcess) {
 				if (adapter) {
-					await adapter.sendMessage(
-						message.channelId,
-						"Agent not running.",
-					);
+					await adapter.sendMessage(message.channelId, "Agent not running.");
 				}
 				return;
 			}
@@ -555,9 +602,7 @@ const adapterCallbacks: AdapterCallbacks = {
 				if (!provider || !modelId) return;
 
 				// Only admins can actually switch models
-				if (
-					!isAdmin(message.platform as Platform, message.userId)
-				) {
+				if (!isAdmin(message.platform as Platform, message.userId)) {
 					if (adapter) {
 						await adapter.sendMessage(
 							message.channelId,
@@ -577,8 +622,7 @@ const adapterCallbacks: AdapterCallbacks = {
 						data?: { name: string };
 					};
 					if (result.success) {
-						const name =
-							result.data?.name || `${provider}/${modelId}`;
+						const name = result.data?.name || `${provider}/${modelId}`;
 						if (adapter) {
 							await adapter.sendMessage(
 								message.channelId,
@@ -625,9 +669,7 @@ const adapterCallbacks: AdapterCallbacks = {
 							sendButtons?: (
 								ch: string,
 								text: string,
-								btns: Array<
-									Array<{ text: string; data: string }>
-								>,
+								btns: Array<Array<{ text: string; data: string }>>,
 							) => Promise<string>;
 						};
 						if (telegram?.sendButtons) {
@@ -645,10 +687,7 @@ const adapterCallbacks: AdapterCallbacks = {
 						} else if (adapter) {
 							// Text fallback
 							const list = models
-								.map(
-									(m) =>
-										`• ${m.provider}/${m.id} — ${m.name}`,
-								)
+								.map((m) => `• ${m.provider}/${m.id} — ${m.name}`)
 								.join("\n");
 							await adapter.sendMessage(
 								message.channelId,
@@ -674,9 +713,7 @@ const adapterCallbacks: AdapterCallbacks = {
 			}
 
 			// /model provider/modelId — only admins can switch
-			if (
-				!isAdmin(message.platform as Platform, message.userId)
-			) {
+			if (!isAdmin(message.platform as Platform, message.userId)) {
 				if (adapter) {
 					await adapter.sendMessage(
 						message.channelId,
@@ -736,40 +773,38 @@ const adapterCallbacks: AdapterCallbacks = {
 		// ── Admin restart command ──
 		if (/^\/restart$/i.test(message.content.trim())) {
 			if (!isAdmin(message.platform as Platform, message.userId)) {
-						// Non-admin: let pi handle it as a normal prompt
+				// Non-admin: let pi handle it as a normal prompt
 			} else {
-						const adapter = state.adapters.get(message.platform);
-						if (adapter) {
-								await adapter.sendMessage(
-										message.channelId,
-										"♻️ Restarting pi agent…",
-								);
-						}
+				const adapter = state.adapters.get(message.platform);
+				if (adapter) {
+					await adapter.sendMessage(
+						message.channelId,
+						"♻️ Restarting pi agent…",
+					);
+				}
 
-						// Kill and restart the pi RPC process
-						if (rpcProcess) {
-								rpcProcess.kill();
-								rpcProcess = null;
-						}
-						// Reject any pending completions
-						while (pendingCompletions.length > 0) {
-								const c = pendingCompletions.shift()!;
-								clearTimeout(c.timer);
-								c.reject(new Error("Agent restarted by admin"));
-						}
-						rpcProcess = createRpcProcess();
+				// Kill and restart the pi RPC process
+				if (rpcProcess) {
+					rpcProcess.kill();
+					rpcProcess = null;
+				}
+				// Reject any pending completions
+				while (pendingCompletions.length > 0) {
+					const c = pendingCompletions.shift()!;
+					clearTimeout(c.timer);
+					c.reject(new Error("Agent restarted by admin"));
+				}
+				rpcProcess = createRpcProcess();
 
-						logger.info(
-								`[gateway] Admin ${message.userId} restarted pi agent`,
-						);
+				logger.info(`[gateway] Admin ${message.userId} restarted pi agent`);
 
-						if (adapter) {
-								await adapter.sendMessage(
-										message.channelId,
-										"✅ Pi agent restarted.",
-								);
-						}
-						return;
+				if (adapter) {
+					await adapter.sendMessage(
+						message.channelId,
+						"✅ Pi agent restarted.",
+					);
+				}
+				return;
 			}
 		}
 
@@ -783,13 +818,48 @@ const adapterCallbacks: AdapterCallbacks = {
 			if (adapter) {
 				try {
 					await adapter.setTyping(message.channelId, true);
-					sentId = await adapter.sendMessage(message.channelId, "🤔");
+					sentId = await adapter.sendMessage(message.channelId, "⏳ Thinking…");
 				} catch {
 					// If sendMessage itself fails, don't even try to process
 					logger.error("[gateway] Failed to send initial placeholder message");
 					return;
 				}
 			}
+
+			// Track which channel triggered this prompt for UI request routing
+			setActiveChannel({
+				platform: message.platform,
+				channelId: message.channelId,
+			});
+
+			let preText = "";
+
+			// When extension_ui_request arrives (select prompt about to show),
+			// flush full accumulated text into the placeholder
+			setFlushHandler(() => {
+				if (!adapter) return;
+				const completion = pendingCompletions[0];
+				if (completion?.streamedText && sentId) {
+					preText = completion.streamedText;
+					adapter
+						.editMessage(message.channelId, sentId, completion.streamedText)
+						.catch(() => {});
+				}
+			});
+			// When user clicks (via handleInteractiveResponse), invalidate
+			// old placeholder and redirect to fresh message
+			setStreamRedirectHandler(() => {
+				if (!adapter) return;
+				const completion = pendingCompletions[0];
+				if (completion) completion.streamedText = "";
+				sentId = undefined;
+				adapter
+					.sendMessage(message.channelId, "⏳ Thinking…")
+					.then((newId) => {
+						sentId = newId;
+					})
+					.catch(() => {});
+			});
 
 			try {
 				logger.info(
@@ -804,10 +874,11 @@ const adapterCallbacks: AdapterCallbacks = {
 					adapter && sentId
 						? (streamText: string) => {
 								const now = Date.now();
-								if (now - lastEditTime >= EDIT_THROTTLE_MS) {
+								const currentId = sentId;
+								if (currentId && now - lastEditTime >= EDIT_THROTTLE_MS) {
 									lastEditTime = now;
 									adapter
-										.editMessage(message.channelId, sentId!, streamText)
+										.editMessage(message.channelId, currentId, streamText)
 										.catch(() => {});
 								}
 							}
@@ -819,11 +890,26 @@ const adapterCallbacks: AdapterCallbacks = {
 				);
 
 				if (responseText && adapter) {
+					// Walk char-by-char to strip pre-question text from the full
+					// agent_end response when a flush happened
+					let finalText = responseText;
+					if (preText) {
+						let pos = 0;
+						while (
+							pos < preText.length &&
+							pos < responseText.length &&
+							preText[pos] === responseText[pos]
+						) {
+							pos++;
+						}
+						if (pos >= preText.length) {
+							finalText = responseText.slice(pos).trim();
+						}
+					}
 					if (sentId) {
-						// Final edit — replace streaming placeholder with complete text
-						await adapter.editMessage(message.channelId, sentId, responseText);
+						await adapter.editMessage(message.channelId, sentId, finalText);
 					} else {
-						await adapter.sendMessage(message.channelId, responseText);
+						await adapter.sendMessage(message.channelId, finalText);
 					}
 					await adapter.setTyping(message.channelId, false);
 					logger.info("[gateway] Response sent to platform successfully");
@@ -863,6 +949,9 @@ const adapterCallbacks: AdapterCallbacks = {
 		} else {
 			logger.warn("[gateway] pi agent not running — cannot process message");
 		}
+	},
+	onInteractiveResponse: (response: InteractiveResponse) => {
+		handleInteractiveResponse(response);
 	},
 	onDisconnect: () => {
 		logger.info("[gateway] Platform adapter disconnected");

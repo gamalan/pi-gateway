@@ -258,13 +258,6 @@ const DEFAULT_POLICIES: ToolPolicy[] = [
 	{
 		platform: null,
 		userId: null,
-		toolName: "ask_user_question",
-		action: "deny",
-		priority: 0,
-	},
-	{
-		platform: null,
-		userId: null,
 		toolName: "wait",
 		action: "deny",
 		priority: 0,
