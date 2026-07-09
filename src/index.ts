@@ -309,13 +309,19 @@ function broadcastClients(event: string, data: unknown): void {
 
 // RPC to pi agent
 function createRpcProcess(): any {
+	const extensionPath = join(
+		getPackageRoot(import.meta.url),
+		"dist",
+		"extensions",
+		"pi-gateway-ask-user-rpc.js",
+	);
 	const proc = spawn(
 		"pi",
 		[
 			"--mode",
 			"rpc",
 			"--extension",
-			"dist/extensions/pi-gateway-ask-user-rpc.js",
+			extensionPath,
 		],
 		{
 			stdio: ["pipe", "pipe", "pipe"],
