@@ -774,6 +774,18 @@ const adapterCallbacks: AdapterCallbacks = {
 		if (/^\/restart$/i.test(message.content.trim())) {
 			if (!isAdmin(message.platform as Platform, message.userId)) {
 				// Non-admin: let pi handle it as a normal prompt
+			} else if (IS_DAEMON) {
+				// In daemon mode: restart the entire gateway
+				const adapter = state.adapters.get(message.platform);
+				if (adapter) {
+					await adapter.sendMessage(
+						message.channelId,
+						"♻️ Restarting gateway daemon…",
+					);
+				}
+				// Send SIGHUP to self for graceful restart
+				process.kill(process.pid, "SIGHUP");
+				return;
 			} else {
 				const adapter = state.adapters.get(message.platform);
 				if (adapter) {
@@ -824,6 +836,15 @@ const adapterCallbacks: AdapterCallbacks = {
 					logger.error("[gateway] Failed to send initial placeholder message");
 					return;
 				}
+			}
+
+			// Keep the typing indicator alive while waiting for a response.
+			// Telegram's typing action lasts ~5s, so send a heartbeat every 4s.
+			let typingInterval: ReturnType<typeof setInterval> | undefined;
+			if (adapter) {
+				typingInterval = setInterval(() => {
+					adapter!.setTyping(message.channelId, true).catch(() => {});
+				}, 4000);
 			}
 
 			// Track which channel triggered this prompt for UI request routing
@@ -911,6 +932,7 @@ const adapterCallbacks: AdapterCallbacks = {
 					} else {
 						await adapter.sendMessage(message.channelId, finalText);
 					}
+					clearInterval(typingInterval);
 					await adapter.setTyping(message.channelId, false);
 					logger.info("[gateway] Response sent to platform successfully");
 				} else if (!responseText && adapter) {
@@ -927,10 +949,12 @@ const adapterCallbacks: AdapterCallbacks = {
 							"I processed your message but had no text response. Please try again.",
 						);
 					}
+					clearInterval(typingInterval);
 					await adapter.setTyping(message.channelId, false);
 				}
 			} catch (err) {
 				logger.error("[gateway] RPC error processing message:", err);
+				clearInterval(typingInterval);
 				if (adapter) {
 					try {
 						const errorMsg =
@@ -2193,6 +2217,15 @@ async function detachAndRun(): Promise<void> {
 	process.on("SIGTERM", shutdown);
 	process.on("SIGINT", shutdown);
 
+	// SIGHUP: graceful restart (stop, reload config, start)
+	process.on("SIGHUP", async () => {
+		logger.info("[pi-gateway] SIGHUP received — restarting daemon...");
+		stopGatewayServer();
+		config = loadConfig();
+		await startGatewayServer(config.port);
+		logger.info("[pi-gateway] Daemon restarted via SIGHUP");
+	});
+
 	// ── Crash resilience ──
 	process.on("uncaughtException", (err) => {
 		logger.error(
@@ -2240,6 +2273,22 @@ async function startGatewayServer(port: number): Promise<void> {
 
 function stopGatewayServer(): void {
 	if (!state.running) return;
+
+	// Send shutdown message to all active chat channels before stopping
+	const db = initSessionStore();
+	const rows = db
+		.prepare(
+			"SELECT DISTINCT platform, channel_id FROM sessions WHERE is_background = 0",
+		)
+		.all() as Array<{ platform: string; channel_id: string }>;
+	for (const row of rows) {
+		const adapter = state.adapters.get(row.platform);
+		if (adapter) {
+			adapter
+				.sendMessage(row.channel_id, "🔌 Gateway daemon is shutting down…")
+				.catch(() => {});
+		}
+	}
 
 	for (const adapter of state.adapters.values()) {
 		adapter.stop().catch(() => {});
