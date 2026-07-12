@@ -43,6 +43,7 @@
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1",
+    "undici": "^8.7.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {
