@@ -15,6 +15,37 @@ import {
 	type InteractivePrompt,
 } from "./base.js";
 import { logger } from "../logger.js";
+import * as dns from "node:dns";
+
+// DNS-over-HTTPS providers for resolving api.telegram.org when the system
+// resolver returns a blocked IP (e.g. GFW). Mirrors Hermes agent design.
+const DOH_PROVIDERS = [
+	{ url: "https://dns.google/resolve?name=api.telegram.org&type=A" },
+	{ url: "https://cloudflare-dns.com/dns-query?name=api.telegram.org&type=A", headers: { Accept: "application/dns-json" } },
+];
+const SEED_IPS = ["149.154.166.110", "149.154.167.220", "149.154.175.50"];
+
+let _cachedFallbackIp: string | null = null;
+async function _resolveTelegramIp(): Promise<string> {
+	if (_cachedFallbackIp) return _cachedFallbackIp;
+	for (const provider of DOH_PROVIDERS) {
+		try {
+			const resp = await fetch(provider.url, {
+				signal: AbortSignal.timeout(4_000),
+				headers: { Accept: "application/dns-json", ...(provider.headers || {}) },
+			});
+			if (!resp.ok) continue;
+			const body = (await resp.json()) as { Answer?: Array<{ type: number; data: string }> };
+			const ips = (body.Answer || []).filter(a => a.type === 1).map(a => a.data);
+			if (ips.length > 0) {
+				_cachedFallbackIp = ips[0];
+				return _cachedFallbackIp;
+			}
+		} catch { continue; }
+	}
+	_cachedFallbackIp = SEED_IPS[0];
+	return _cachedFallbackIp;
+}
 
 interface TelegramConfig extends PlatformConfig {
 	platform: "telegram";
@@ -25,6 +56,8 @@ interface TelegramConfig extends PlatformConfig {
 	webhookSecret?: string;
 	allowedChats?: string[]; // Whitelist chat IDs
 	requireUsername?: boolean; // Require user to have a username
+	/** Chat ID to send startup notification to (e.g. "♻️ Gateway online"). */
+	startupNotifyChannel?: string;
 }
 
 export type { TelegramConfig };
@@ -97,22 +130,65 @@ export class TelegramAdapter extends BaseAdapter {
 		} else {
 			logger.info("[Telegram] No webhookUrl — will use long polling");
 		}
+
+		// Startup notification to configured admin/home channel
+		await this.sendStartupNotification();
 	}
 
 	private async apiRequest(
 		endpoint: string,
 		options: RequestInit = {},
 	): Promise<Response> {
-		const url = `https://api.telegram.org/bot${this.config.token}${endpoint}`;
-		return fetch(url, {
-			...options,
-			signal: AbortSignal.timeout(35_000), // slightly above Telegram's 30s long-poll
-			headers: {
-				"Content-Type": "application/json",
-				Connection: "close", // prevent stale undici connections
-				...options.headers,
-			},
-		});
+		const baseUrl = `https://api.telegram.org/bot${this.config.token}${endpoint}`;
+		return this._fetchWithFallback(baseUrl, options);
+	}
+
+	private async _fetchWithFallback(
+		url: string,
+		options: RequestInit = {},
+	): Promise<Response> {
+		try {
+			return await fetch(url, {
+				...options,
+				signal: AbortSignal.timeout(35_000),
+				headers: {
+					"Content-Type": "application/json",
+					Connection: "close",
+					...options.headers,
+				},
+			});
+		} catch (err) {
+			logger.warn(`[Telegram] Primary fetch failed, trying DNS fallback: ${(err as Error).message}`);
+			const fallbackIp = await _resolveTelegramIp();
+			const fallbackUrl = url.replace("https://api.telegram.org", `https://${fallbackIp}`);
+			try {
+				return await fetch(fallbackUrl, {
+					...options,
+					signal: AbortSignal.timeout(35_000),
+					headers: {
+						"Content-Type": "application/json",
+						Connection: "close",
+						Host: "api.telegram.org",
+						...options.headers,
+					},
+				});
+			} catch (err2) {
+				logger.error(`[Telegram] Fallback fetch also failed: ${(err2 as Error).message}`);
+				throw err2;
+			}
+		}
+	}
+
+	async sendStartupNotification(): Promise<void> {
+		try {
+			const notifyChannel = this.config.startupNotifyChannel;
+			if (notifyChannel) {
+				await this.sendMessage(notifyChannel, "♻️ Gateway online — Pi agent is back and ready.");
+				logger.info(`[Telegram] Startup notification sent to ${notifyChannel}`);
+			}
+		} catch (err) {
+			logger.warn(`[Telegram] Startup notification failed: ${(err as Error).message}`);
+		}
 	}
 
 	async start(callbacks): Promise<void> {
@@ -120,7 +196,12 @@ export class TelegramAdapter extends BaseAdapter {
 
 		if (!this.config.webhookUrl) {
 			// Long polling — keep a persistent connection and receive messages near-real-time
-			this.startLongPolling();
+			// Delay startup slightly to allow any lingering connections from a previous
+			// daemon instance to drain (avoids Telegram HTTP 409 conflicts on restart).
+			setTimeout(() => {
+				if (this.pollingActive) return; // Already started
+				this.startLongPolling();
+			}, 4_000);
 		}
 		// Webhook mode: gateway's HTTP server calls handleWebhookUpdate() on each POST
 	}
@@ -155,7 +236,13 @@ export class TelegramAdapter extends BaseAdapter {
 				backoff = 1000;
 
 				if (!response.ok) {
-					logger.error(`[Telegram] Poll HTTP ${response.status}`);
+					// 409 Conflict is expected after a daemon restart — the previous long-poll
+					// connection from the old process hasn't timed out yet. Log as WARN, not ERROR.
+					if (response.status === 409) {
+						logger.warn(`[Telegram] Poll HTTP 409 (conflict — lingering connection from previous daemon), retrying in 5s`);
+					} else {
+						logger.error(`[Telegram] Poll HTTP ${response.status}`);
+					}
 					await this.sleep(5000);
 					continue;
 				}
@@ -167,9 +254,8 @@ export class TelegramAdapter extends BaseAdapter {
 
 				if (data.ok && data.result && data.result.length > 0) {
 					for (const update of data.result) {
-						// Fire-and-forget: do NOT await — msg processing blocks up to 5 min
-						// while waiting for agent_end. If we await, no new /getUpdates
-						// requests can be made, and callback queries get buffered by Telegram.
+						// Fire-and-forget: keep the poll loop fast. Concurrency control
+						// (per-session queuing) is handled at the message handler level.
 						this.handleUpdate(update).catch((err) => {
 							logger.error(
 								`[Telegram] Error handling update: ${(err as Error).message || err}`,

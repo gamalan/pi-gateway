@@ -45,6 +45,14 @@ import {
 	getOrCreateSession,
 	listSessions,
 	touchSession,
+	getRecentMessagesSummary,
+	saveMessage,
+	markResumePending,
+	clearResumePending,
+	wasCleanShutdown,
+	markCleanShutdown,
+	clearCleanShutdownMarker,
+	suspendRecentlyActive,
 	type SessionConfig,
 } from "./sessions/store.js";
 import { logger } from "./logger.js";
@@ -106,6 +114,17 @@ import {
 	cleanupPendingUiRequests,
 } from "./interactive.js";
 
+// Proxy support for Telegram/API calls
+import { setGlobalDispatcher, ProxyAgent } from "undici";
+try {
+	const proxyUrl = process.env.HTTP_PROXY || process.env.http_proxy || "";
+	if (proxyUrl) {
+		setGlobalDispatcher(new ProxyAgent(proxyUrl));
+	}
+} catch (e) {
+	// proxy setup non-critical
+}
+
 // Types
 interface GatewayConfig {
 	port: number;
@@ -149,6 +168,8 @@ interface GatewayConfig {
 			/** Public URL for Telegram webhook (e.g. https://example.com/webhook/telegram).
 			 *  When omitted, long polling is used automatically. */
 			webhookUrl?: string;
+			/** Chat ID to send startup notification when gateway comes online. */
+			startupNotifyChannel?: string;
 		};
 		slack?: {
 			enabled: boolean;
@@ -244,6 +265,59 @@ interface PendingCompletion {
 }
 const pendingCompletions: PendingCompletion[] = [];
 
+// Re-entrant guard for RPC respawn (debounce multiple exit events)
+let _rpcRespawnTimer: ReturnType<typeof setTimeout> | null = null;
+
+// ── Message queue for when RPC is down ──
+// During daemon restart there's a window where the RPC process hasn't
+// started yet. Instead of dropping messages, we queue them and process
+// once the RPC process comes back online.
+interface QueuedMessage {
+	message: import("./adapters/base.js").PlatformMessage;
+	retries: number;
+}
+
+const pendingMessageQueue: QueuedMessage[] = [];
+const MAX_QUEUE_RETRIES = 5;
+const QUEUE_RETRY_DELAY_MS = 3000;
+
+/** Process one queued message. Returns true if it was handed off to the RPC flow. */
+function processQueuedMessage(qm: QueuedMessage): boolean {
+	if (!rpcProcess) return false;
+	const handler = adapterCallbacks.onMessage;
+	if (!handler) return false;
+	handler(qm.message).catch((err: Error) => {
+		logger.error("[gateway] Queued message processing failed:", err);
+	});
+	return true;
+}
+
+/**
+ * Drain the pending message queue. Called after RPC process (re)starts.
+ * Messages that still can't be delivered are retried on a timer.
+ */
+function drainPendingMessageQueue(): void {
+	const remaining: QueuedMessage[] = [];
+	for (const qm of pendingMessageQueue) {
+		if (!processQueuedMessage(qm)) {
+			if (qm.retries < MAX_QUEUE_RETRIES) {
+				qm.retries++;
+				remaining.push(qm);
+			} else {
+				logger.warn(
+					`[gateway] Dropping queued message after ${MAX_QUEUE_RETRIES} retries: ${qm.message.content.slice(0, 80)}`,
+				);
+			}
+		}
+	}
+	pendingMessageQueue.length = 0;
+	pendingMessageQueue.push(...remaining);
+	if (remaining.length > 0) {
+		// Schedule another drain attempt
+		setTimeout(drainPendingMessageQueue, QUEUE_RETRY_DELAY_MS);
+	}
+}
+
 // Load/save config
 function loadConfig(): GatewayConfig {
 	try {
@@ -325,6 +399,10 @@ function createRpcProcess(): any {
 		],
 		{
 			stdio: ["pipe", "pipe", "pipe"],
+			// Use a stable CWD so the child doesn't inherit a potentially-deleted
+			// working directory (common during daemon SIGHUP restarts where the
+			// original CWD may no longer exist, causing process.cwd() to throw ENOENT).
+			cwd: GATEWAY_CONFIG_DIR,
 			env: {
 				...process.env,
 				OLLAMA_HOST: process.env.OLLAMA_HOST || "localhost:11434",
@@ -454,6 +532,23 @@ function createRpcProcess(): any {
 		setActiveChannel(null);
 		rpcProcess = null;
 		broadcastClients("agent_disconnected", { code });
+
+		// ── Auto-respawn ──
+		// If the gateway is still running (not in shutdown), respawn the RPC
+		// process after a short delay so the gateway self-heals from transient
+		// crashes (e.g. CWD deleted, OOM, etc.). Debounced via _rpcRespawnTimer.
+		if (state.running) {
+			if (_rpcRespawnTimer) clearTimeout(_rpcRespawnTimer);
+			_rpcRespawnTimer = setTimeout(() => {
+				_rpcRespawnTimer = null;
+				if (!rpcProcess && state.running) {
+					logger.info("[gateway] Auto-respawning pi RPC process...");
+					rpcProcess = createRpcProcess();
+					// Drain any queued messages
+					drainPendingMessageQueue();
+				}
+			}, 2_000);
+		}
 	});
 
 	return proc;
@@ -538,6 +633,19 @@ async function sendPromptRpc(
 		const timer = setTimeout(() => {
 			const idx = pendingCompletions.findIndex((c) => c.timer === timer);
 			if (idx !== -1) pendingCompletions.splice(idx, 1);
+			// Kill stuck RPC process and spawn a fresh one
+			logger.warn("[gateway] Prompt timeout — restarting RPC process");
+			if (rpcProcess) {
+				rpcProcess.kill("SIGTERM");
+				rpcProcess = null;
+			}
+			try {
+				rpcProcess = createRpcProcess();
+				logger.info("[gateway] RPC process restarted after timeout");
+				drainPendingMessageQueue();
+			} catch (e) {
+				logger.error("[gateway] Failed to restart RPC process after timeout:", e);
+			}
 			reject(
 				new Error(
 					`Prompt completion timeout — no agent_end received within ${minutes} minute${minutes === 1 ? "" : "s"}`,
@@ -831,6 +939,30 @@ const adapterCallbacks: AdapterCallbacks = {
 			const adapter = state.adapters.get(message.platform);
 			const guard = buildPolicyGuard(message.platform, message.userId);
 
+			// ══ Session continuity: resume_pending detection ══
+			// If the session was interrupted by a restart, inject system note + recent history
+			if (session.resumePending) {
+				const reasonPhrase =
+					session.resumeReason === "restart_timeout"
+						? "a gateway restart"
+						: session.resumeReason === "shutdown_timeout"
+							? "a gateway shutdown"
+							: "a gateway interruption";
+
+				const historySummary = getRecentMessagesSummary(session.id, 5);
+				let resumeNote = `[System note: The previous turn was interrupted by ${reasonPhrase}; the gateway is now back online. Any restart/shutdown command in the history has already run — do NOT re-execute or verify it. Focus on the user's NEW message below. Do NOT re-execute old tool calls — skip any unfinished work from the conversation history.]`;
+
+				if (historySummary) {
+					resumeNote += `\n\n[Recent conversation history before interruption]:\n${historySummary}`;
+				}
+
+				message.content = `${resumeNote}\n\n${message.content}`;
+				logger.info(`[gateway] Injected resume context for session ${session.id.slice(0, 12)}...`);
+				// Clear resume_pending immediately so retries don't re-inject context
+				clearResumePending(session.id);
+			}
+			// ════════════════════════════════════════════════
+
 			// Send an initial placeholder message so we can stream edits into it
 			let sentId: string | undefined;
 			if (adapter) {
@@ -941,6 +1073,23 @@ const adapterCallbacks: AdapterCallbacks = {
 					clearInterval(typingInterval);
 					await adapter.setTyping(message.channelId, false);
 					logger.info("[gateway] Response sent to platform successfully");
+
+					// ══ Session continuity: save messages ══
+					try {
+						// Save user message to history
+						saveMessage(session.id, "user", message.content);
+						// Save assistant response to history
+						if (responseText) {
+							saveMessage(session.id, "assistant", responseText);
+						}
+					} catch (e) {
+						logger.debug(`[gateway] History save failed: ${e}`);
+					}
+					// ════════════════════════════════════════════════════════════
+
+					// Drain any queued messages since RPC is now free
+					drainPendingMessageQueue();
+
 				} else if (!responseText && adapter) {
 					logger.warn("[gateway] Response text was empty — nothing to send");
 					if (sentId) {
@@ -957,9 +1106,23 @@ const adapterCallbacks: AdapterCallbacks = {
 					}
 					clearInterval(typingInterval);
 					await adapter.setTyping(message.channelId, false);
+
+					// Drain any queued messages since RPC is now free
+					drainPendingMessageQueue();
 				}
 			} catch (err) {
-				logger.error("[gateway] RPC error processing message:", err);
+
+				const errMsg = String(err instanceof Error ? err.message : err);
+				logger.error("[gateway] RPC error processing message:", errMsg);
+
+				// If RPC is busy, queue for retry (fallback for edge cases)
+				if (errMsg.includes("already processing") || errMsg.includes("already in progress")) {
+					logger.info("[gateway] RPC busy — queueing message for retry");
+					pendingMessageQueue.push({ message, retries: 0 });
+					clearInterval(typingInterval);
+					if (adapter) await adapter.setTyping(message.channelId, false);
+					return;
+				}
 				clearInterval(typingInterval);
 				if (adapter) {
 					try {
@@ -975,9 +1138,20 @@ const adapterCallbacks: AdapterCallbacks = {
 						logger.error("[gateway] Failed to send error message:", sendErr);
 					}
 				}
+
+				drainPendingMessageQueue();
 			}
 		} else {
-			logger.warn("[gateway] pi agent not running — cannot process message");
+			// Queue message for retry when RPC comes back online
+			// (e.g. during daemon restart where the RPC process hasn't started yet).
+			logger.warn(
+				`[gateway] pi agent not running — queueing message from ${message.platform}/${message.channelId}`,
+			);
+			pendingMessageQueue.push({ message, retries: 0 });
+			// If no respawn is scheduled, schedule a drain attempt
+			if (!_rpcRespawnTimer) {
+				setTimeout(drainPendingMessageQueue, QUEUE_RETRY_DELAY_MS);
+			}
 		}
 	},
 	onInteractiveResponse: (response: InteractiveResponse) => {
@@ -1040,6 +1214,7 @@ async function initializeAdapters(): Promise<void> {
 				platform: "telegram",
 				token: config.platforms.telegram.token,
 				webhookUrl: config.platforms.telegram.webhookUrl,
+				startupNotifyChannel: config.platforms.telegram.startupNotifyChannel,
 			});
 			await telegram.initialize();
 			await telegram.start(adapterCallbacks);
@@ -1830,20 +2005,26 @@ export default function (pi: ExtensionAPI) {
 		description: "Check Hermes-style gateway status",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
+			const daemonAlive = isDaemonRunning();
+			const daemonPid = daemonAlive ? parseInt(readFileSync(PID_FILE, "utf-8").trim()) : null;
 			return {
 				content: [
 					{
 						type: "text",
 						text:
-							`Gateway: ${state.running ? "Running" : "Stopped"}\n` +
+							(daemonAlive
+								? `Gateway Daemon: 🟢 Running (PID ${daemonPid})\n`
+								: `Gateway: ${state.running ? "🟢 Running (inline)" : "🔴 Stopped"}\n`) +
 							`Adapters: ${state.adapters.size}\n` +
 							`Clients: ${state.clients.size}\n` +
 							`Sessions: ${state.sessions.size}\n` +
-							`Agent: ${rpcProcess ? "Connected" : "Disconnected"}`,
+							`Agent: ${rpcProcess ? "Connected" : daemonAlive ? "Connected (daemon)" : "Disconnected"}`,
 					},
 				],
 				details: {
 					running: state.running,
+					daemonRunning: daemonAlive,
+					daemonPid,
 					adapters: state.adapters.size,
 					clients: state.clients.size,
 					sessions: state.sessions.size,
@@ -2209,10 +2390,29 @@ async function detachAndRun(): Promise<void> {
 	// Start
 	await startGatewayServer(config.port);
 
+	// ══ Crash recovery: detect unclean shutdown ══
+	if (!wasCleanShutdown()) {
+		logger.info("[pi-gateway] Previous shutdown was not clean — checking for sessions to resume");
+		try {
+			const count = suspendRecentlyActive(120);
+			if (count > 0) {
+				logger.info(`[pi-gateway] Marked ${count} session(s) as resumable from crash`);
+			}
+		} catch (e) {
+			logger.warn(`[pi-gateway] Crash recovery failed: ${e}`);
+		}
+	} else {
+		logger.info("[pi-gateway] Previous shutdown was clean");
+	}
+	// Remove marker to ensure next boot detects crashes correctly
+	clearCleanShutdownMarker();
+	// ══════════════════════════════════════════════════
+
 	// Graceful shutdown
-	const shutdown = () => {
+	const shutdown = async () => {
 		logger.info("[pi-gateway] Daemon shutting down...");
 		stopGatewayServer();
+		markCleanShutdown();
 		try {
 			unlinkSync(PID_FILE);
 		} catch {
@@ -2223,13 +2423,19 @@ async function detachAndRun(): Promise<void> {
 	process.on("SIGTERM", shutdown);
 	process.on("SIGINT", shutdown);
 
-	// SIGHUP: graceful restart (stop, reload config, start)
+
+	// SIGHUP: graceful restart (spawn new daemon, exit current)
 	process.on("SIGHUP", async () => {
-		logger.info("[pi-gateway] SIGHUP received — restarting daemon...");
-		stopGatewayServer();
-		config = loadConfig();
-		await startGatewayServer(config.port);
-		logger.info("[pi-gateway] Daemon restarted via SIGHUP");
+		logger.info("[pi-gateway] SIGHUP received — spawning new daemon...");
+		stopGatewayServer(true);
+		const child = spawn(process.execPath, [new URL("../dist/index.js", import.meta.url).pathname, "--daemon"], {
+			detached: true,
+			stdio: "ignore",
+			env: { ...process.env },
+		});
+		child.unref();
+		logger.info(`[pi-gateway] New daemon spawned (PID ${child.pid}), exiting...`);
+		process.exit(0);
 	});
 
 	// ── Crash resilience ──
@@ -2277,22 +2483,43 @@ async function startGatewayServer(port: number): Promise<void> {
 	updateStatus();
 }
 
-function stopGatewayServer(): void {
+function stopGatewayServer(skipBroadcast = false): void {
 	if (!state.running) return;
 
+
+	// ══ Phase 1: Pre-drain marking — save resume_pending for all active sessions ══
+	// This runs BEFORE killing RPC, so even if process is force-killed after this,
+	// the resume markers are already persisted in SQLite.
+	const reason = skipBroadcast ? "restart_timeout" : "shutdown_timeout";
+	for (const [key, session] of state.sessions) {
+		try {
+			markResumePending(session.platform, session.channelId, reason);
+		} catch (e) {
+			logger.debug(`[gateway] pre-drain markResumePending failed: ${e}`);
+		}
+	}
+	logger.info(`[gateway] Marked ${state.sessions.size} session(s) as resume_pending`);
+	// ═════════════════════════════════════════════════════════════════════════════
+
+	// Set state to not-running BEFORE killing RPC to prevent auto-respawn
+	// from firing during intentional shutdown (the exit handler checks this flag).
+	state.running = false;
+
 	// Send shutdown message to all active chat channels before stopping
-	const db = initSessionStore();
-	const rows = db
-		.prepare(
-			"SELECT DISTINCT platform, channel_id FROM sessions WHERE is_background = 0",
-		)
-		.all() as Array<{ platform: string; channel_id: string }>;
-	for (const row of rows) {
-		const adapter = state.adapters.get(row.platform);
-		if (adapter) {
-			adapter
-				.sendMessage(row.channel_id, "🔌 Gateway daemon is shutting down…")
-				.catch(() => {});
+	if (!skipBroadcast) {
+		const db = initSessionStore();
+		const rows = db
+			.prepare(
+				"SELECT DISTINCT platform, channel_id FROM sessions WHERE is_background = 0",
+			)
+			.all() as Array<{ platform: string; channel_id: string }>;
+		for (const row of rows) {
+			const adapter = state.adapters.get(row.platform);
+			if (adapter) {
+				adapter
+					.sendMessage(row.channel_id, "🔌 Gateway daemon is shutting down…")
+					.catch(() => {});
+			}
 		}
 	}
 
@@ -2303,6 +2530,12 @@ function stopGatewayServer(): void {
 
 	stopCron();
 
+	// Kill the RPC process
+	if (rpcProcess) {
+		rpcProcess.kill();
+		rpcProcess = null;
+	}
+
 	for (const ws of state.clients.values()) {
 		ws.close(1000, "Server shutting down");
 	}
@@ -2312,11 +2545,5 @@ function stopGatewayServer(): void {
 	server = null;
 	wss = null;
 
-	if (rpcProcess) {
-		rpcProcess.kill();
-		rpcProcess = null;
-	}
-
-	state.running = false;
 	updateStatus();
 }
