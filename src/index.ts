@@ -22,8 +22,8 @@ import {
 	copyFileSync,
 	mkdirSync,
 	writeFileSync,
-	unlinkSync,
 	watchFile,
+	unwatchFile,
 } from "node:fs";
 import {
 	createServer,
@@ -53,6 +53,16 @@ import {
 	GATEWAY_CONFIG_FILE,
 	getPackageRoot,
 } from "./paths.js";
+import {
+	createGatewayStatusReport,
+	fetchGatewayHealth,
+	normalizeGatewayHealthConfig,
+	parseGatewayPid,
+	removeGatewayPidFile,
+	resolveGatewayStatus,
+	waitForGatewayHealth,
+	writeGatewayPidFile,
+} from "./status.js";
 import {
 	initSecurityStore,
 	isUserAllowed,
@@ -200,27 +210,38 @@ let wss: WebSocketServer | null = null;
 let rpcProcess: ReturnType<typeof spawn> | null = null;
 let globalCtx: ExtensionContext | null = null;
 let cronInterval: ReturnType<typeof setInterval> | null = null;
+let statusRefreshInterval: ReturnType<typeof setInterval> | null = null;
+let lastGatewayStatusText: string | null = null;
+let statusUpdateGeneration = 0;
+let lastDetachedHealthConfig: GatewayConfig | null = null;
+let configReloadQueue = Promise.resolve();
+let daemonShuttingDown = false;
+
+const STATUS_REFRESH_INTERVAL_MS = 2000;
 
 // PID file for detached daemon mode
 const PID_FILE = join(GATEWAY_CONFIG_DIR, "gateway.pid");
 
-function isDaemonRunning(): boolean {
-	if (!existsSync(PID_FILE)) return false;
+function readDaemonPid(): number | null {
+	if (!existsSync(PID_FILE)) return null;
+
+	let rawPid: string;
 	try {
-		const rawPid = readFileSync(PID_FILE, "utf-8").trim();
-		const pid = parseInt(rawPid);
-		if (!pid) return false;
-		// Signal 0 checks if process exists without actually sending a signal
-		process.kill(pid, 0);
-		return true;
+		rawPid = readFileSync(PID_FILE, "utf-8").trim();
 	} catch {
-		// Stale PID file — process no longer running
-		try {
-			unlinkSync(PID_FILE);
-		} catch {
-			/* ignore */
-		}
-		return false;
+		return null;
+	}
+
+	const pid = parseGatewayPid(rawPid);
+	if (pid === null) return null;
+
+	try {
+		process.kill(pid, 0);
+		return pid;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "EPERM") return pid;
+		removeGatewayPidFile(PID_FILE, pid);
+		return null;
 	}
 }
 
@@ -245,32 +266,79 @@ interface PendingCompletion {
 const pendingCompletions: PendingCompletion[] = [];
 
 // Load/save config
+function mergeGatewayConfig(value: unknown): GatewayConfig {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error("Gateway config must be a JSON object");
+	}
+	const parsed = value as Partial<GatewayConfig>;
+	const healthConfig = normalizeGatewayHealthConfig(parsed);
+	if (!healthConfig) throw new Error("Invalid gateway host, port, or tokens");
+	if (
+		parsed.security === null ||
+		(parsed.security !== undefined &&
+			(typeof parsed.security !== "object" || Array.isArray(parsed.security)))
+	) {
+		throw new Error("config.security must be an object");
+	}
+	if (
+		parsed.sessions === null ||
+		(parsed.sessions !== undefined &&
+			(typeof parsed.sessions !== "object" || Array.isArray(parsed.sessions)))
+	) {
+		throw new Error("config.sessions must be an object");
+	}
+
+	const security: Partial<GatewayConfig["security"]> = parsed.security ?? {};
+	const sessions: Partial<GatewayConfig["sessions"]> = parsed.sessions ?? {};
+	const rateLimit: Partial<GatewayConfig["security"]["rateLimit"]> =
+		security.rateLimit ?? {};
+	const merged = {
+		...DEFAULT_CONFIG,
+		...parsed,
+		...healthConfig,
+		security: {
+			...DEFAULT_CONFIG.security,
+			...security,
+			rateLimit: { ...DEFAULT_CONFIG.security.rateLimit, ...rateLimit },
+		},
+		sessions: { ...DEFAULT_CONFIG.sessions, ...sessions },
+		platforms: { ...DEFAULT_CONFIG.platforms, ...(parsed.platforms ?? {}) },
+	} as GatewayConfig;
+
+	if (!(["daily", "idle", "both"] as string[]).includes(merged.sessions.resetPolicy)) {
+		throw new Error("Invalid sessions.resetPolicy");
+	}
+	if (
+		!Number.isInteger(merged.sessions.dailyHour) ||
+		merged.sessions.dailyHour < 0 ||
+		merged.sessions.dailyHour > 23 ||
+		!Number.isFinite(merged.sessions.idleMinutes) ||
+		merged.sessions.idleMinutes <= 0
+	) {
+		throw new Error("Invalid session reset timing");
+	}
+	return merged;
+}
+
 function loadConfig(): GatewayConfig {
 	try {
-		if (existsSync(GATEWAY_CONFIG_FILE)) {
-			return {
-				...DEFAULT_CONFIG,
-				...JSON.parse(readFileSync(GATEWAY_CONFIG_FILE, "utf-8")),
-			};
-		}
-
-		// No config file yet — seed from default template
-		const packageRoot = getPackageRoot(import.meta.url);
-		const defaultConfigPath = join(
-			packageRoot,
-			"config",
-			"config.default.json",
-		);
-		if (existsSync(defaultConfigPath)) {
-			if (!existsSync(GATEWAY_CONFIG_DIR)) {
+		if (!existsSync(GATEWAY_CONFIG_FILE)) {
+			const packageRoot = getPackageRoot(import.meta.url);
+			const defaultConfigPath = join(
+				packageRoot,
+				"config",
+				"config.default.json",
+			);
+			if (existsSync(defaultConfigPath)) {
 				mkdirSync(GATEWAY_CONFIG_DIR, { recursive: true });
+				copyFileSync(defaultConfigPath, GATEWAY_CONFIG_FILE);
+				logger.info("[gateway] Seeded default config at", GATEWAY_CONFIG_FILE);
 			}
-			copyFileSync(defaultConfigPath, GATEWAY_CONFIG_FILE);
-			logger.info("[gateway] Seeded default config at", GATEWAY_CONFIG_FILE);
-			return {
-				...DEFAULT_CONFIG,
-				...JSON.parse(readFileSync(GATEWAY_CONFIG_FILE, "utf-8")),
-			};
+		}
+		if (existsSync(GATEWAY_CONFIG_FILE)) {
+			return mergeGatewayConfig(
+				JSON.parse(readFileSync(GATEWAY_CONFIG_FILE, "utf-8")),
+			);
 		}
 	} catch (err) {
 		logger.error(
@@ -278,7 +346,7 @@ function loadConfig(): GatewayConfig {
 			err,
 		);
 	}
-	return { ...DEFAULT_CONFIG };
+	return mergeGatewayConfig({});
 }
 
 // Token auth
@@ -985,7 +1053,7 @@ const adapterCallbacks: AdapterCallbacks = {
 	},
 	onDisconnect: () => {
 		logger.info("[gateway] Platform adapter disconnected");
-		updateStatus();
+		void updateStatus();
 	},
 };
 
@@ -1180,6 +1248,8 @@ async function handleHttpRequest(
 		res.end(
 			JSON.stringify({
 				running: state.running,
+				mode: IS_DAEMON ? "daemon" : "inline",
+				pid: process.pid,
 				adapters: Array.from(state.adapters.keys()),
 				clients: state.clients.size,
 				sessions: state.sessions.size,
@@ -1268,22 +1338,53 @@ function handleWebSocket(ws: WebSocket, req: IncomingMessage): void {
 }
 
 // Status update
-function updateStatus(): void {
-	if (!globalCtx) return;
+async function updateStatus(): Promise<void> {
+	const ctx = globalCtx;
+	if (!ctx) return;
 
-	const adapterCount = state.adapters.size;
+	const generation = ++statusUpdateGeneration;
+	const daemonPid = state.running ? null : readDaemonPid();
+	const statusText = await resolveGatewayStatus({
+		inlineRunning: state.running,
+		adapterCount: state.adapters.size,
+		daemonProcessRunning: daemonPid !== null,
+		getDaemonHealth: () =>
+			daemonPid === null ? Promise.resolve(null) : getDetachedGatewayHealth(daemonPid),
+	});
 
-	const statusText = state.running
-		? adapterCount > 0
-			? `🟢 Gateway (${adapterCount} platform${adapterCount !== 1 ? "s" : ""})`
-			: `🟡 Gateway (waiting)`
-		: "🔴 Gateway";
+	if (
+		ctx !== globalCtx ||
+		generation !== statusUpdateGeneration ||
+		statusText === lastGatewayStatusText
+	) {
+		return;
+	}
+	lastGatewayStatusText = statusText;
+	ctx.ui.setStatus("gateway", statusText);
+}
 
-	globalCtx.ui.setStatus("gateway", statusText);
+function readDetachedHealthConfig(): GatewayConfig {
+	try {
+		const parsed = JSON.parse(readFileSync(GATEWAY_CONFIG_FILE, "utf-8"));
+		const healthConfig = normalizeGatewayHealthConfig(parsed);
+		if (!healthConfig) throw new Error("Invalid detached health configuration");
+		lastDetachedHealthConfig = {
+			...lastDetachedHealthConfig,
+			...healthConfig,
+		} as GatewayConfig;
+	} catch {
+		// Keep the last valid probe target during a partial or invalid config write.
+	}
+	return lastDetachedHealthConfig ?? config;
+}
+
+async function getDetachedGatewayHealth(pid: number) {
+	return fetchGatewayHealth(readDetachedHealthConfig(), pid);
 }
 
 export default function (pi: ExtensionAPI) {
 	config = loadConfig();
+	lastDetachedHealthConfig = config;
 	state = {
 		running: false,
 		adapters: new Map(),
@@ -1329,9 +1430,24 @@ export default function (pi: ExtensionAPI) {
 						parts.includes("-d") || parts.includes("--detached");
 
 					if (isDetached) {
-						// Check if already running
-						if (existsSync(PID_FILE) && isDaemonRunning()) {
-							ctx.ui.notify("Gateway daemon is already running.", "info");
+						const existingPid = readDaemonPid();
+						if (existingPid !== null) {
+							const existingHealth = await waitForGatewayHealth(
+								readDetachedHealthConfig(),
+								existingPid,
+								1500,
+							);
+							if (existingHealth) {
+								ctx.ui.notify(
+									`Gateway daemon is already ${existingHealth.running ? "running" : "initializing"}.`,
+									"info",
+								);
+								return;
+							}
+							ctx.ui.notify(
+								`A live process owns the gateway PID file (PID ${existingPid}), but its daemon API is unavailable. Refusing to start another daemon.`,
+								"error",
+							);
 							return;
 						}
 
@@ -1344,9 +1460,26 @@ export default function (pi: ExtensionAPI) {
 							env: process.env,
 						});
 						child.unref();
+						if (child.pid === undefined) {
+							ctx.ui.notify("Failed to spawn gateway daemon", "error");
+							return;
+						}
+
+						const startedHealth = await waitForGatewayHealth(
+							readDetachedHealthConfig(),
+							child.pid,
+							5000,
+						);
+						if (!startedHealth) {
+							ctx.ui.notify(
+								`Gateway daemon spawn could not be verified (PID ${child.pid}). Check the gateway log.`,
+								"error",
+							);
+							return;
+						}
 
 						ctx.ui.notify(
-							`🔌 Gateway daemon started (PID ${child.pid}).\n\n` +
+							`🔌 Gateway daemon ${startedHealth.running ? "started" : "is initializing"} (PID ${child.pid}).\n\n` +
 								"It will keep running after pi closes.\n" +
 								"Use /gateway status to check, /gateway stop to kill.",
 							"info",
@@ -1376,19 +1509,39 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				case "stop": {
-					// Handle daemon mode first
-					if (isDaemonRunning()) {
-						try {
-							const rawPid = readFileSync(PID_FILE, "utf-8").trim();
-							const pid = parseInt(rawPid);
-							process.kill(pid, "SIGTERM");
+					// Never signal a PID until the daemon API confirms the same identity.
+					const daemonPid = readDaemonPid();
+					if (daemonPid !== null) {
+						const health = await waitForGatewayHealth(
+							readDetachedHealthConfig(),
+							daemonPid,
+							1500,
+						);
+						if (!health) {
 							ctx.ui.notify(
-								`🛑 Sent stop signal to daemon (PID ${pid})`,
-								"info",
+								"Refusing to signal an unverified daemon PID. Check /gateway status.",
+								"error",
 							);
+							return;
+						}
+						try {
+							process.kill(daemonPid, "SIGTERM");
 						} catch {
 							ctx.ui.notify("Failed to stop daemon", "error");
+							return;
 						}
+
+						for (let attempt = 0; attempt < 40; attempt++) {
+							await new Promise((resolve) => setTimeout(resolve, 250));
+							if (readDaemonPid() !== daemonPid) {
+								ctx.ui.notify("Gateway daemon stopped", "info");
+								return;
+							}
+						}
+						ctx.ui.notify(
+							`Stop signal sent, but daemon PID ${daemonPid} is still present.`,
+							"warning",
+						);
 						return;
 					}
 
@@ -1397,14 +1550,14 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 
-					stopGatewayServer();
+					await stopGatewayServer();
 					ctx.ui.notify("Gateway stopped", "info");
 					return;
 				}
 
 				case "restart": {
 					if (state.running) {
-						stopGatewayServer();
+						await stopGatewayServer();
 					}
 
 					// Reload config and start
@@ -1423,42 +1576,54 @@ export default function (pi: ExtensionAPI) {
 
 				case "status": {
 					const lines: string[] = [];
+					const daemonPid = state.running ? null : readDaemonPid();
+					const daemonHealth =
+						daemonPid === null ? null : await getDetachedGatewayHealth(daemonPid);
+					const report = createGatewayStatusReport({
+						inlineRunning: state.running,
+						inlineAdapters: state.adapters.size,
+						inlineClients: state.clients.size,
+						inlineSessions: state.sessions.size,
+						inlineAgentConnected: Boolean(rpcProcess),
+						daemonProcessRunning: daemonPid !== null,
+						daemonHealth,
+					});
+					const displayConfig =
+						daemonPid === null ? config : readDetachedHealthConfig();
+					const metric = (value: number | null) => value ?? "unknown";
 
-					// Show daemon status if detached mode
-					const daemonAlive = isDaemonRunning();
-					if (daemonAlive) {
-						try {
-							const rawPid = readFileSync(PID_FILE, "utf-8").trim();
-							lines.push(`Daemon: 🟢 Running (PID ${rawPid})`);
-						} catch {
-							lines.push("Daemon: 🟢 Running");
-						}
+					if (daemonPid !== null) {
+						lines.push(
+							daemonHealth?.running
+								? `Daemon: 🟢 Verified (PID ${daemonPid})`
+								: daemonHealth
+									? `Daemon: 🟡 Initializing (PID ${daemonPid})`
+									: `Daemon: 🟡 Unavailable (PID ${daemonPid})`,
+						);
 						lines.push("");
 					}
 
+					lines.push(`Mode: ${report.mode}`);
+					lines.push(`Port: ${displayConfig.port}`);
+					lines.push(`Adapters: ${metric(report.adapters)}`);
+					lines.push(`Clients: ${metric(report.clients)}`);
+					lines.push(`Sessions: ${metric(report.sessions)}`);
 					lines.push(
-						`Mode: ${daemonAlive ? "Detached" : state.running ? "🟢 Inline" : "🔴 Stopped"}`,
-					);
-					lines.push(`Port: ${config.port}`);
-					lines.push(`Adapters: ${state.adapters.size}`);
-					lines.push(`Clients: ${state.clients.size}`);
-					lines.push(`Sessions: ${state.sessions.size}`);
-					lines.push(
-						`Agent: ${rpcProcess ? "✅ Connected" : "❌ Disconnected"}`,
+						`Agent: ${report.agentConnected === null ? "Unknown" : report.agentConnected ? "✅ Connected" : "❌ Disconnected"}`,
 					);
 					lines.push("");
-					lines.push(`Session Reset: ${config.sessions.resetPolicy}`);
-					lines.push(`  - Daily at ${config.sessions.dailyHour}:00`);
-					lines.push(`  - Idle after ${config.sessions.idleMinutes} min`);
+					lines.push(`Session Reset: ${displayConfig.sessions.resetPolicy}`);
+					lines.push(`  - Daily at ${displayConfig.sessions.dailyHour}:00`);
+					lines.push(`  - Idle after ${displayConfig.sessions.idleMinutes} min`);
 					lines.push("");
 					const adminCount =
 						listAdmins().length +
-						Object.values(config.security.adminUids ?? {}).reduce(
+						Object.values(displayConfig.security.adminUids ?? {}).reduce(
 							(sum, uids) => sum + uids.length,
 							0,
 						);
 					lines.push(
-						`Security: ${config.security.allowAll ? "Allow all" : "Allowlist only"}${Object.values(config.security.allowedUids ?? {}).reduce((sum, uids) => sum + uids.length, 0) > 0 ? ` (+${Object.values(config.security.allowedUids ?? {}).reduce((sum, uids) => sum + uids.length, 0)} config UIDs)` : ""}`,
+						`Security: ${displayConfig.security.allowAll ? "Allow all" : "Allowlist only"}${Object.values(displayConfig.security.allowedUids ?? {}).reduce((sum, uids) => sum + uids.length, 0) > 0 ? ` (+${Object.values(displayConfig.security.allowedUids ?? {}).reduce((sum, uids) => sum + uids.length, 0)} config UIDs)` : ""}`,
 					);
 					lines.push(`Admins: ${adminCount}`);
 
@@ -1830,23 +1995,53 @@ export default function (pi: ExtensionAPI) {
 		description: "Check Hermes-style gateway status",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
+			const daemonPid = state.running ? null : readDaemonPid();
+			const daemonProcessRunning = daemonPid !== null;
+			const daemonHealth =
+				daemonPid === null ? null : await getDetachedGatewayHealth(daemonPid);
+			const report = createGatewayStatusReport({
+				inlineRunning: state.running,
+				inlineAdapters: state.adapters.size,
+				inlineClients: state.clients.size,
+				inlineSessions: state.sessions.size,
+				inlineAgentConnected: Boolean(rpcProcess),
+				daemonProcessRunning,
+				daemonHealth,
+			});
+			const metric = (value: number | null) => value ?? "unknown";
+			const statusConfig =
+				daemonPid === null ? config : readDetachedHealthConfig();
+			const statusPid = daemonPid ?? (state.running ? process.pid : null);
+			const agent =
+				report.agentConnected === null
+					? "Unknown"
+					: report.agentConnected
+						? "Connected"
+						: "Disconnected";
+
 			return {
 				content: [
 					{
 						type: "text",
 						text:
-							`Gateway: ${state.running ? "Running" : "Stopped"}\n` +
-							`Adapters: ${state.adapters.size}\n` +
-							`Clients: ${state.clients.size}\n` +
-							`Sessions: ${state.sessions.size}\n` +
-							`Agent: ${rpcProcess ? "Connected" : "Disconnected"}`,
+							`Gateway: ${report.status}\n` +
+							`PID: ${statusPid ?? "unknown"}\n` +
+							`Port: ${statusConfig.port}\n` +
+							`Adapters: ${metric(report.adapters)}\n` +
+							`Clients: ${metric(report.clients)}\n` +
+							`Sessions: ${metric(report.sessions)}\n` +
+							`Agent: ${agent}`,
 					},
 				],
 				details: {
-					running: state.running,
-					adapters: state.adapters.size,
-					clients: state.clients.size,
-					sessions: state.sessions.size,
+					running: report.running,
+					mode: report.mode,
+					pid: statusPid,
+					port: statusConfig.port,
+					adapters: report.adapters,
+					clients: report.clients,
+					sessions: report.sessions,
+					agentConnected: report.agentConnected,
 				},
 			};
 		},
@@ -2111,10 +2306,28 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// Notify on session start
+	// Keep the footer synchronized with detached daemons started outside this session.
 	pi.on("session_start", async (_event, ctx) => {
+		if (statusRefreshInterval) clearInterval(statusRefreshInterval);
+		statusRefreshInterval = null;
 		globalCtx = ctx;
-		updateStatus();
+		lastGatewayStatusText = null;
+		await updateStatus();
+		if (globalCtx !== ctx) return;
+
+		statusRefreshInterval = setInterval(
+			updateStatus,
+			STATUS_REFRESH_INTERVAL_MS,
+		);
+		statusRefreshInterval.unref();
+	});
+
+	pi.on("session_shutdown", async () => {
+		statusUpdateGeneration++;
+		if (statusRefreshInterval) clearInterval(statusRefreshInterval);
+		statusRefreshInterval = null;
+		lastGatewayStatusText = null;
+		globalCtx = null;
 	});
 
 	logger.info("[pi-gateway] Hermes-style gateway extension loaded");
@@ -2124,47 +2337,63 @@ export default function (pi: ExtensionAPI) {
 // Daemon mode — run gateway as a standalone detached process
 // ═══════════════════════════════════════════════════════════
 
-/**
- * Watch ~/.pi/gateway/config.json for changes and auto-reload.
- * Uses a cache: invalid configs are rejected (logged but not applied).
- */
+/** Apply config changes with listener rollback so the daemon stays manageable. */
+async function reloadDaemonConfig(): Promise<void> {
+	const previousConfig = config;
+	const nextConfig = mergeGatewayConfig(
+		JSON.parse(readFileSync(GATEWAY_CONFIG_FILE, "utf-8")),
+	);
+	const listenerChanged =
+		nextConfig.host !== previousConfig.host ||
+		nextConfig.port !== previousConfig.port;
+
+	if (!listenerChanged || !state.running) {
+		config = nextConfig;
+		return;
+	}
+
+	await stopGatewayServer();
+	config = nextConfig;
+	try {
+		await startGatewayServer(config.port);
+	} catch (rebindError) {
+		await stopGatewayServer();
+		config = previousConfig;
+		try {
+			await startGatewayServer(config.port);
+			writeFileSync(
+				GATEWAY_CONFIG_FILE,
+				`${JSON.stringify(previousConfig, null, 2)}\n`,
+			);
+		} catch (rollbackError) {
+			logger.error(
+				`[pi-gateway] Listener rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+			);
+			process.kill(process.pid, "SIGTERM");
+		}
+		throw new Error(
+			`Listener rebind failed and was rolled back: ${rebindError instanceof Error ? rebindError.message : String(rebindError)}`,
+		);
+	}
+}
+
+/** Watch ~/.pi/gateway/config.json for validated, serialized reloads. */
 function startConfigWatcher(): void {
 	if (!existsSync(GATEWAY_CONFIG_FILE)) return;
 
-	// Seed the cache with the current valid config
-	let cachedConfig = config;
-
-	watchFile(GATEWAY_CONFIG_FILE, (_curr, _prev) => {
-		try {
-			const raw = readFileSync(GATEWAY_CONFIG_FILE, "utf-8");
-			const parsed = JSON.parse(raw);
-
-			// Validate shape — must be a plain object with expected fields
-			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-				throw new Error("Config must be a JSON object, got " + typeof parsed);
-			}
-			if (parsed.port != null && typeof parsed.port !== "number") {
-				throw new Error("config.port must be a number");
-			}
-			if (parsed.security != null && typeof parsed.security !== "object") {
-				throw new Error("config.security must be an object");
-			}
-			if (parsed.sessions != null && typeof parsed.sessions !== "object") {
-				throw new Error("config.sessions must be an object");
-			}
-
-			// Valid — apply and update cache
-			config = { ...DEFAULT_CONFIG, ...parsed };
-			cachedConfig = config;
-			logger.info("[pi-gateway] Config reloaded from", GATEWAY_CONFIG_FILE);
-		} catch (err) {
-			logger.error(
-				"[pi-gateway] Invalid config — keeping previous valid config. Error:",
-				err instanceof Error ? err.message : String(err),
-			);
-			// Restore known-good cache
-			config = cachedConfig;
-		}
+	watchFile(GATEWAY_CONFIG_FILE, () => {
+		if (daemonShuttingDown) return;
+		configReloadQueue = configReloadQueue
+			.then(reloadDaemonConfig)
+			.then(() => {
+				logger.info("[pi-gateway] Config reloaded from", GATEWAY_CONFIG_FILE);
+			})
+			.catch((error) => {
+				logger.error(
+					"[pi-gateway] Config reload failed — keeping previous valid config. Error:",
+					error instanceof Error ? error.message : String(error),
+				);
+			});
 	});
 
 	logger.info(
@@ -2180,64 +2409,44 @@ if (IS_DAEMON) {
 }
 
 async function detachAndRun(): Promise<void> {
-	// Detach from parent process
 	process.title = "pi-gateway-daemon";
 	process.stdout.write = () => true;
 	process.stderr.write = () => true;
 
-	// Write PID file
+	// Acquire the daemon identity atomically before opening any resources.
 	try {
-		writeFileSync(PID_FILE, String(process.pid));
-	} catch {
-		// Non-fatal
+		writeGatewayPidFile(PID_FILE, process.pid);
+	} catch (error) {
+		logger.error(
+			`[pi-gateway] Failed to acquire daemon PID file: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		process.exit(1);
 	}
 
-	logger.info(`[pi-gateway] Daemon started (PID ${process.pid})`);
-
-	// Init
-	config = loadConfig();
-	state = {
-		running: false,
-		adapters: new Map(),
-		clients: new Map(),
-		sessions: new Map(),
-	};
-	initSessionStore();
-	initSecurityStore();
-	initBackgroundTasks();
-
-	// Start
-	await startGatewayServer(config.port);
-
-	// Graceful shutdown
-	const shutdown = () => {
+	let shutdownStarted = false;
+	const shutdown = async (exitCode = 0) => {
+		if (shutdownStarted) return;
+		shutdownStarted = true;
+		daemonShuttingDown = true;
+		unwatchFile(GATEWAY_CONFIG_FILE);
 		logger.info("[pi-gateway] Daemon shutting down...");
-		stopGatewayServer();
-		try {
-			unlinkSync(PID_FILE);
-		} catch {
-			/* ignore */
+		await configReloadQueue.catch(() => {});
+		if (state?.running || server || rpcProcess) {
+			await Promise.race([
+				stopGatewayServer(),
+				new Promise<void>((resolve) => setTimeout(resolve, 10000)),
+			]);
 		}
-		process.exit(0);
+		removeGatewayPidFile(PID_FILE, process.pid);
+		process.exit(exitCode);
 	};
-	process.on("SIGTERM", shutdown);
-	process.on("SIGINT", shutdown);
-
-	// SIGHUP: graceful restart (stop, reload config, start)
-	process.on("SIGHUP", async () => {
-		logger.info("[pi-gateway] SIGHUP received — restarting daemon...");
-		stopGatewayServer();
-		config = loadConfig();
-		await startGatewayServer(config.port);
-		logger.info("[pi-gateway] Daemon restarted via SIGHUP");
-	});
-
-	// ── Crash resilience ──
+	process.on("SIGTERM", () => void shutdown());
+	process.on("SIGINT", () => void shutdown());
 	process.on("uncaughtException", (err) => {
 		logger.error(
 			`[pi-gateway] UNCAUGHT EXCEPTION: ${err.stack || err.message}`,
 		);
-		process.exit(1);
+		void shutdown(1);
 	});
 	process.on("unhandledRejection", (reason) => {
 		logger.error(
@@ -2245,8 +2454,43 @@ async function detachAndRun(): Promise<void> {
 		);
 	});
 
-	// ── Config file watcher — auto-reload when ~/.pi/gateway/config.json changes ──
-	startConfigWatcher();
+	logger.info(`[pi-gateway] Daemon starting (PID ${process.pid})`);
+	try {
+		config = loadConfig();
+		state = {
+			running: false,
+			adapters: new Map(),
+			clients: new Map(),
+			sessions: new Map(),
+		};
+		initSessionStore();
+		initSecurityStore();
+		initBackgroundTasks();
+
+		process.on("SIGHUP", () => {
+			if (daemonShuttingDown) return;
+			configReloadQueue = configReloadQueue
+				.then(async () => {
+					logger.info("[pi-gateway] SIGHUP received — reloading config...");
+					await reloadDaemonConfig();
+					logger.info("[pi-gateway] SIGHUP config reload complete");
+				})
+				.catch((error) => {
+					logger.error(
+						`[pi-gateway] SIGHUP reload failed: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				});
+		});
+
+		await startGatewayServer(config.port);
+		startConfigWatcher();
+		logger.info(`[pi-gateway] Daemon ready (PID ${process.pid})`);
+	} catch (error) {
+		logger.error(
+			`[pi-gateway] Daemon startup failed: ${error instanceof Error ? error.stack || error.message : String(error)}`,
+		);
+		await shutdown(1);
+	}
 }
 
 async function startGatewayServer(port: number): Promise<void> {
@@ -2257,11 +2501,6 @@ async function startGatewayServer(port: number): Promise<void> {
 
 	server = createServer(handleHttpRequest);
 
-	if (config.enableWebSocket) {
-		wss = new WebSocketServer({ server });
-		wss.on("connection", handleWebSocket);
-	}
-
 	await new Promise<void>((resolve, reject) => {
 		server!.listen(port, config.host, () => {
 			logger.info(`[gateway] HTTP server started on ${config.host}:${port}`);
@@ -2270,15 +2509,21 @@ async function startGatewayServer(port: number): Promise<void> {
 		server!.on("error", reject);
 	});
 
+	if (config.enableWebSocket) {
+		wss = new WebSocketServer({ server });
+		wss.on("connection", handleWebSocket);
+	}
+
 	rpcProcess = createRpcProcess();
 	await initializeAdapters();
 	startCron();
 	state.running = true;
-	updateStatus();
+	await updateStatus();
 }
 
-function stopGatewayServer(): void {
-	if (!state.running) return;
+async function stopGatewayServer(): Promise<void> {
+	if (!state?.running && !server && !rpcProcess) return;
+	state.running = false;
 
 	// Send shutdown message to all active chat channels before stopping
 	const db = initSessionStore();
@@ -2296,9 +2541,9 @@ function stopGatewayServer(): void {
 		}
 	}
 
-	for (const adapter of state.adapters.values()) {
-		adapter.stop().catch(() => {});
-	}
+	await Promise.allSettled(
+		Array.from(state.adapters.values(), (adapter) => adapter.stop()),
+	);
 	state.adapters.clear();
 
 	stopCron();
@@ -2308,15 +2553,25 @@ function stopGatewayServer(): void {
 	}
 	state.clients.clear();
 
-	server?.close();
+	const serverToClose = server;
+	const webSocketServerToClose = wss;
 	server = null;
 	wss = null;
+	try {
+		webSocketServerToClose?.close();
+	} catch {
+		/* server was never listening */
+	}
+	if (serverToClose) {
+		await new Promise<void>((resolve) => {
+			serverToClose.close(() => resolve());
+		});
+	}
 
 	if (rpcProcess) {
 		rpcProcess.kill();
 		rpcProcess = null;
 	}
 
-	state.running = false;
-	updateStatus();
+	void updateStatus();
 }

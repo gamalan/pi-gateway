@@ -8,31 +8,63 @@
  *   pi-gateway status        Show daemon status
  */
 
-import { spawn, execSync } from "node:child_process";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import {
+	fetchGatewayHealth,
+	normalizeGatewayHealthConfig,
+	parseGatewayPid,
+	removeGatewayPidFile,
+	waitForGatewayHealth,
+	type GatewayHealthConfig,
+} from "./status.js";
 
 const PID_FILE = join(homedir(), ".pi", "gateway", "gateway.pid");
 const DAEMON_ENTRY = new URL("../dist/index.js", import.meta.url).pathname;
 
 function isRunning(): { running: boolean; pid?: number } {
 	if (!existsSync(PID_FILE)) return { running: false };
+
+	let rawPid: string;
 	try {
-		const raw = readFileSync(PID_FILE, "utf-8").trim();
-		const pid = parseInt(raw);
-		if (!pid) return { running: false };
+		rawPid = readFileSync(PID_FILE, "utf-8").trim();
+	} catch {
+		return { running: false };
+	}
+	const pid = parseGatewayPid(rawPid);
+	if (pid === null) return { running: false };
+
+	try {
 		process.kill(pid, 0); // signal 0 checks existence
 		return { running: true, pid };
-	} catch {
-		try {
-			unlinkSync(PID_FILE);
-		} catch {
-			/* stale */
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "EPERM") {
+			return { running: true, pid };
 		}
+		removeGatewayPidFile(PID_FILE, pid);
 		return { running: false };
 	}
 }
+
+function loadHealthConfig(): GatewayHealthConfig {
+	try {
+		const parsed = JSON.parse(
+			readFileSync(join(homedir(), ".pi", "gateway", "config.json"), "utf-8"),
+		);
+		return normalizeGatewayHealthConfig(parsed) ?? normalizeGatewayHealthConfig({})!;
+	} catch {
+		return normalizeGatewayHealthConfig({})!;
+	}
+}
+
+async function getVerifiedHealth(pid: number) {
+	return fetchGatewayHealth(loadHealthConfig(), pid);
+}
+
+const delay = (milliseconds: number) =>
+	new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
 
 function printHelp(): void {
 	console.log(`
@@ -58,21 +90,51 @@ const cmd = process.argv[2];
 switch (cmd) {
 	case "start": {
 		const { running, pid } = isRunning();
-		if (running) {
-			console.log(`Gateway daemon is already running (PID ${pid}).`);
-			process.exit(0);
+		if (running && pid !== undefined) {
+			const existingHealth = await waitForGatewayHealth(
+				loadHealthConfig(),
+				pid,
+				1500,
+			);
+			if (existingHealth) {
+				console.log(
+					`Gateway daemon is already ${existingHealth.running ? "running" : "initializing"} (PID ${pid}).`,
+				);
+				process.exit(0);
+			}
+			console.error(
+				`A live process owns the gateway PID file (PID ${pid}), but its daemon API is unavailable. Refusing to start another daemon.`,
+			);
+			process.exit(1);
 		}
 
 		console.log("Starting gateway daemon...");
-
 		const child = spawn(process.execPath, [DAEMON_ENTRY, "--daemon"], {
 			detached: true,
 			stdio: "ignore",
 			env: process.env,
 		});
 		child.unref();
+		if (child.pid === undefined) {
+			console.error("Failed to spawn gateway daemon.");
+			process.exit(1);
+		}
 
-		console.log(`✅ Gateway daemon started (PID ${child.pid}).`);
+		const startedHealth = await waitForGatewayHealth(
+			loadHealthConfig(),
+			child.pid,
+			5000,
+		);
+		if (!startedHealth) {
+			console.error(
+				`Gateway daemon spawn could not be verified (PID ${child.pid}). Check ~/.pi/gateway/gateway.log.`,
+			);
+			process.exit(1);
+		}
+
+		console.log(
+			`✅ Gateway daemon ${startedHealth.running ? "started" : "is initializing"} (PID ${child.pid}).`,
+		);
 		console.log("   It will keep running after this terminal closes.");
 		console.log("   Logs: ~/.pi/gateway/gateway.log");
 		break;
@@ -85,27 +147,47 @@ switch (cmd) {
 			process.exit(0);
 		}
 
+		const verifiedHealth = await waitForGatewayHealth(
+			loadHealthConfig(),
+			pid!,
+			1500,
+		);
+		if (!verifiedHealth) {
+			console.error(
+				"Refusing to signal an unverified daemon PID. Check `pi-gateway status`.",
+			);
+			process.exit(1);
+		}
+
 		console.log(`Stopping gateway daemon (PID ${pid})...`);
 		process.kill(pid!, "SIGTERM");
 
-		// Wait a moment for graceful shutdown
-		setTimeout(() => {
-			const { running: stillRunning } = isRunning();
-			if (stillRunning) {
-				console.log("Daemon didn't stop gracefully — forcing...");
-				try {
-					process.kill(pid!, "SIGKILL");
-				} catch {
-					/* already dead */
-				}
-				try {
-					unlinkSync(PID_FILE);
-				} catch {
-					/* ignore */
-				}
-			}
+		let currentState = isRunning();
+		for (let attempt = 0; attempt < 40; attempt++) {
+			if (!currentState.running || currentState.pid !== pid) break;
+			await delay(250);
+			currentState = isRunning();
+		}
+		if (!currentState.running || currentState.pid !== pid) {
 			console.log("✅ Gateway daemon stopped.");
-		}, 2000);
+			break;
+		}
+
+		const stillVerified = await getVerifiedHealth(pid!);
+		if (!stillVerified) {
+			console.error("Daemon is still alive but no longer verifiable; not force-killing.");
+			process.exit(1);
+		}
+
+		console.log("Daemon didn't stop gracefully — forcing...");
+		process.kill(pid!, "SIGKILL");
+		await delay(200);
+		const finalState = isRunning();
+		if (finalState.running && finalState.pid === pid) {
+			console.error("Failed to stop gateway daemon.");
+			process.exit(1);
+		}
+		console.log("✅ Gateway daemon stopped.");
 		break;
 	}
 
@@ -116,34 +198,27 @@ switch (cmd) {
 			process.exit(0);
 		}
 
-		console.log(`Gateway daemon: 🟢 Running (PID ${pid})`);
+		const health = await getVerifiedHealth(pid!);
+		console.log(
+			health?.running
+				? `Gateway daemon: 🟢 Verified (PID ${pid})`
+				: health
+					? `Gateway daemon: 🟡 Initializing (PID ${pid})`
+					: `Gateway daemon: 🟡 Unavailable (PID ${pid})`,
+		);
 		console.log(`PID file: ${PID_FILE}`);
 
-		// Try to fetch status from the HTTP API
-		try {
-			const configRaw = readFileSync(
-				join(homedir(), ".pi", "gateway", "config.json"),
-				"utf-8",
-			);
-			const config = JSON.parse(configRaw);
-			const port = config.port || 3847;
-
-			try {
-				const resp = execSync(`curl -s http://localhost:${port}/api/status`, {
-					timeout: 3000,
-				});
-				const status = JSON.parse(resp.toString());
-				console.log(`Port: ${port}`);
-				console.log(`Running: ${status.running ? "yes" : "no"}`);
-				console.log(
-					`Adapters: ${(status.adapters || []).join(", ") || "none"}`,
-				);
-				console.log(`Agent connected: ${status.agent ? "yes" : "no"}`);
-			} catch {
-				console.log(`Port: ${port} (API unreachable — may still be starting)`);
-			}
-		} catch {
-			console.log("Config file not found.");
+		const healthConfig = loadHealthConfig();
+		console.log(`Mode: ${health ? "Detached" : "Detached unavailable"}`);
+		console.log(`Port: ${healthConfig.port}`);
+		if (health) {
+			console.log(`Running: ${health.running ? "yes" : "initializing"}`);
+			console.log(`Adapters: ${health.adapters.join(", ") || "none"}`);
+			console.log(`Clients: ${health.clients}`);
+			console.log(`Sessions: ${health.sessions}`);
+			console.log(`Agent connected: ${health.agent ? "yes" : "no"}`);
+		} else {
+			console.log("Running: unverified");
 		}
 
 		console.log("Logs: ~/.pi/gateway/gateway.log");

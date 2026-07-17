@@ -47,7 +47,7 @@ Requires pi coding agent (`@earendil-works/pi-coding-agent >= 0.80.3`) and `@sin
 /gateway stop
 ```
 
-The gateway starts on `http://localhost:3847` by default. See `/gateway config` for current settings.
+The gateway starts on `http://localhost:3847` by default. See `/gateway config` for current settings. When detached mode is active, pi's footer shows `🟢 Gateway (daemon)` and automatically follows daemon start/stop changes.
 
 ## Configuration
 
