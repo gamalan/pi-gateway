@@ -10,9 +10,13 @@ import { homedir } from "node:os";
 
 // ── Runtime config paths (user's home directory) ─────────────────
 
-/** Single source of truth: ~/.pi/gateway/config.json */
+/** Single source of truth: ~/.pi/gateway/config.json + config.local.json */
 export const GATEWAY_CONFIG_DIR = join(homedir(), ".pi", "gateway");
 export const GATEWAY_CONFIG_FILE = join(GATEWAY_CONFIG_DIR, "config.json");
+export const GATEWAY_CONFIG_LOCAL_FILE = join(
+	GATEWAY_CONFIG_DIR,
+	"config.local.json",
+);
 
 // ── Package root resolution ──────────────────────────────────────
 

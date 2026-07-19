@@ -14,7 +14,7 @@ import { homedir } from "os";
 import { existsSync, mkdirSync, readFileSync } from "fs";
 import { randomBytes } from "node:crypto";
 import { logger } from "../logger.js";
-import { GATEWAY_CONFIG_FILE } from "../paths.js";
+import { readGatewayConfig } from "../config.js";
 
 export type Platform =
 	| "discord"
@@ -358,8 +358,9 @@ export function cleanupExpiredCodes(): number {
 	return result.changes;
 }
 
-// Shared with index.ts — reads from the single gateway config file.
+// Shared with index.ts — reads the merged gateway config.
 // Schema: the `security` block inside ~/.pi/gateway/config.json
+// with optional overrides from ~/.pi/gateway/config.local.json.
 export interface SecurityConfig {
 	allowAll: boolean;
 	requirePairing: boolean;
@@ -373,10 +374,8 @@ export interface SecurityConfig {
 
 function getSecurityConfig(): SecurityConfig {
 	try {
-		if (existsSync(GATEWAY_CONFIG_FILE)) {
-			const raw = JSON.parse(readFileSync(GATEWAY_CONFIG_FILE, "utf-8"));
-			if (raw.security) return raw.security as SecurityConfig;
-		}
+		const raw = readGatewayConfig();
+		if (raw?.security) return raw.security as SecurityConfig;
 	} catch (err) {
 		logger.error(
 			"[Security] Failed to parse config — using defaults. Error:",

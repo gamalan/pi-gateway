@@ -51,7 +51,7 @@ The gateway starts on `http://localhost:3847` by default. See `/gateway config` 
 
 ## Configuration
 
-Configuration lives at `~/.pi/gateway/config.json`:
+Configuration lives at `~/.pi/gateway/config.json`, with an optional `~/.pi/gateway/config.local.json` overlay for secrets:
 
 ```jsonc
 {
@@ -112,6 +112,9 @@ automatically seeds `~/.pi/gateway/config.json` from the default
 template shipped with the package.  You can also find it at
 `node_modules/pi-gateway/config/config.default.json`.
 
+Put secrets like the Telegram bot token in `config.local.json` so the main
+`config.json` stays shareable/committable.
+
 ### Telegram: webhook vs long polling
 
 The gateway auto-detects the mode based on whether `webhookUrl` is set:
@@ -168,7 +171,7 @@ Skip pairing entirely by listing UIDs in the `security` block of `config.json`:
 - The `"*"` wildcard matches any platform
 - Users in this list are auto-allowed on first contact — no pairing code needed
 - `adminUids` grants full unrestricted access (bypasses all tool policies)
-- All security settings live in the main `config.json` — no separate security file
+- Non-secret settings live in the main `config.json`; secrets can be overridden from `config.local.json`
 
 ### Admin Users
 
@@ -243,10 +246,10 @@ Policies can also be managed from within pi sessions via the `gateway_tool_polic
 **Resolution order** (highest wins): user-specific > platform-specific > global. Ties break deny-first (secure by default). The `*` glob matches any tool name. Admin users always bypass all restrictions.
 
 > **Note:** All security configuration (allowlist, admin UIDs, rate limits)
-> lives in the `security` block of `~/.pi/gateway/config.json`. There is
-> no separate security config file. On first run, the gateway
-> auto-seeds a complete default config so you don't have to write one
-> from scratch.
+> lives in the `security` block of `~/.pi/gateway/config.json`, with
+> optional secrets/overrides in `~/.pi/gateway/config.local.json`. On first
+> run, the gateway auto-seeds a complete default config so you don't have to
+> write one from scratch.
 
 ### Pairing Flow
 
