@@ -13,6 +13,8 @@ import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
+import { readGatewayConfig } from "./config.js";
+
 const PID_FILE = join(homedir(), ".pi", "gateway", "gateway.pid");
 const DAEMON_ENTRY = new URL("../dist/index.js", import.meta.url).pathname;
 
@@ -55,114 +57,118 @@ You can also use /gateway start -d inside pi's TUI for the same effect.
 
 const cmd = process.argv[2];
 
-switch (cmd) {
-	case "start": {
-		const { running, pid } = isRunning();
-		if (running) {
-			console.log(`Gateway daemon is already running (PID ${pid}).`);
-			process.exit(0);
-		}
-
-		console.log("Starting gateway daemon...");
-
-		const child = spawn(process.execPath, [DAEMON_ENTRY, "--daemon"], {
-			detached: true,
-			stdio: "ignore",
-			env: process.env,
-		});
-		child.unref();
-
-		console.log(`✅ Gateway daemon started (PID ${child.pid}).`);
-		console.log("   It will keep running after this terminal closes.");
-		console.log("   Logs: ~/.pi/gateway/gateway.log");
-		break;
+function handleStart(): void {
+	const { running, pid } = isRunning();
+	if (running) {
+		console.log(`Gateway daemon is already running (PID ${pid}).`);
+		process.exit(0);
 	}
 
-	case "stop": {
-		const { running, pid } = isRunning();
-		if (!running) {
-			console.log("No gateway daemon is running.");
-			process.exit(0);
-		}
+	console.log("Starting gateway daemon...");
 
-		console.log(`Stopping gateway daemon (PID ${pid})...`);
-		process.kill(pid!, "SIGTERM");
+	const child = spawn(process.execPath, [DAEMON_ENTRY, "--daemon"], {
+		detached: true,
+		stdio: "ignore",
+		env: process.env,
+	});
+	child.unref();
 
-		// Wait a moment for graceful shutdown
-		setTimeout(() => {
-			const { running: stillRunning } = isRunning();
-			if (stillRunning) {
-				console.log("Daemon didn't stop gracefully — forcing...");
-				try {
-					process.kill(pid!, "SIGKILL");
-				} catch {
-					/* already dead */
-				}
-				try {
-					unlinkSync(PID_FILE);
-				} catch {
-					/* ignore */
-				}
-			}
-			console.log("✅ Gateway daemon stopped.");
-		}, 2000);
-		break;
+	console.log(`✅ Gateway daemon started (PID ${child.pid}).`);
+	console.log("   It will keep running after this terminal closes.");
+	console.log("   Logs: ~/.pi/gateway/gateway.log");
+}
+
+function handleStop(): void {
+	const { running, pid } = isRunning();
+	if (!running) {
+		console.log("No gateway daemon is running.");
+		process.exit(0);
 	}
 
-	case "status": {
-		const { running, pid } = isRunning();
-		if (!running) {
-			console.log("Gateway daemon: 🔴 Not running");
-			process.exit(0);
-		}
+	console.log(`Stopping gateway daemon (PID ${pid})...`);
+	process.kill(pid!, "SIGTERM");
 
-		console.log(`Gateway daemon: 🟢 Running (PID ${pid})`);
-		console.log(`PID file: ${PID_FILE}`);
-
-		// Try to fetch status from the HTTP API
-		try {
-			const configRaw = readFileSync(
-				join(homedir(), ".pi", "gateway", "config.json"),
-				"utf-8",
-			);
-			const config = JSON.parse(configRaw);
-			const port = config.port || 3847;
-
+	// Wait a moment for graceful shutdown
+	setTimeout(() => {
+		const { running: stillRunning } = isRunning();
+		if (stillRunning) {
+			console.log("Daemon didn't stop gracefully — forcing...");
 			try {
-				const resp = execSync(`curl -s http://localhost:${port}/api/status`, {
-					timeout: 3000,
-				});
-				const status = JSON.parse(resp.toString());
-				console.log(`Port: ${port}`);
-				console.log(`Running: ${status.running ? "yes" : "no"}`);
-				console.log(
-					`Adapters: ${(status.adapters || []).join(", ") || "none"}`,
-				);
-				console.log(`Agent connected: ${status.agent ? "yes" : "no"}`);
+				process.kill(pid!, "SIGKILL");
 			} catch {
-				console.log(`Port: ${port} (API unreachable — may still be starting)`);
+				/* already dead */
 			}
-		} catch {
-			console.log("Config file not found.");
-		}
-
-		console.log("Logs: ~/.pi/gateway/gateway.log");
-
-		// Show last 10 log lines
-		const logFile = join(homedir(), ".pi", "gateway", "gateway.log");
-		try {
-			const logContent = readFileSync(logFile, "utf-8");
-			const lines = logContent.trim().split("\n");
-			const last = lines.slice(-10);
-			console.log(`\nLast ${last.length} log lines:`);
-			for (const line of last) {
-				console.log(`  ${line}`);
+			try {
+				unlinkSync(PID_FILE);
+			} catch {
+				/* ignore */
 			}
-		} catch {
-			/* log file not available */
 		}
-		break;
+		console.log("✅ Gateway daemon stopped.");
+	}, 2000);
+}
+
+function handleStatus(): void {
+	const { running, pid } = isRunning();
+	if (!running) {
+		console.log("Gateway daemon: 🔴 Not running");
+		process.exit(0);
 	}
+
+	console.log(`Gateway daemon: 🟢 Running (PID ${pid})`);
+	console.log(`PID file: ${PID_FILE}`);
+
+	// Try to fetch status from the HTTP API
+	try {
+		const port = Number(readGatewayConfig()?.port) || 3847;
+
+		try {
+			const resp = execSync(`curl -s http://localhost:${port}/api/status`, {
+				timeout: 3000,
+			});
+			const status = JSON.parse(resp.toString());
+			console.log(`Port: ${port}`);
+			console.log(`Running: ${status.running ? "yes" : "no"}`);
+			console.log(
+				`Adapters: ${(status.adapters || []).join(", ") || "none"}`,
+			);
+			console.log(`Agent connected: ${status.agent ? "yes" : "no"}`);
+		} catch {
+			console.log(`Port: ${port} (API unreachable — may still be starting)`);
+		}
+	} catch {
+		console.log("Config file not found.");
+	}
+
+	console.log("Logs: ~/.pi/gateway/gateway.log");
+
+	// Show last 10 log lines
+	const logFile = join(homedir(), ".pi", "gateway", "gateway.log");
+	try {
+		const logContent = readFileSync(logFile, "utf-8");
+		const lines = logContent.trim().split("\n");
+		const last = lines.slice(-10);
+		console.log(`\nLast ${last.length} log lines:`);
+		for (const line of last) {
+			console.log(`  ${line}`);
+		}
+	} catch {
+		/* log file not available */
+	}
+}
+
+switch (cmd) {
+	case "start":
+		handleStart();
+		break;
+
+	case "stop":
+		handleStop();
+		break;
+
+	case "status":
+		handleStatus();
+		break;
 
 	default:
 		printHelp();

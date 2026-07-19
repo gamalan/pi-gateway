@@ -51,8 +51,10 @@ import { logger } from "./logger.js";
 import {
 	GATEWAY_CONFIG_DIR,
 	GATEWAY_CONFIG_FILE,
+	GATEWAY_CONFIG_LOCAL_FILE,
 	getPackageRoot,
 } from "./paths.js";
+import { readGatewayConfig } from "./config.js";
 import {
 	initSecurityStore,
 	isUserAllowed,
@@ -224,6 +226,44 @@ function isDaemonRunning(): boolean {
 	}
 }
 
+function readDetachedDaemonPid(): number | null {
+	const rawPid = readFileSync(PID_FILE, "utf-8").trim();
+	const pid = parseInt(rawPid);
+	return pid || null;
+}
+
+function startDetachedDaemon(ctx: ExtensionContext): void {
+	const entryPoint = new URL("../dist/index.js", import.meta.url).pathname;
+	const child = spawn(process.execPath, [entryPoint, "--daemon"], {
+		detached: true,
+		stdio: "ignore",
+		env: process.env,
+	});
+	child.unref();
+
+	ctx.ui.notify(
+		`🔌 Gateway daemon started (PID ${child.pid}).\n\n` +
+			"It will keep running after pi closes.\n" +
+			"Use /gateway status to check, /gateway stop to kill.",
+		"info",
+	);
+}
+
+function stopDetachedDaemon(ctx: ExtensionContext): void {
+	const pid = readDetachedDaemonPid();
+	if (!pid) {
+		ctx.ui.notify("Failed to stop daemon", "error");
+		return;
+	}
+
+	try {
+		process.kill(pid, "SIGTERM");
+		ctx.ui.notify(`🛑 Sent stop signal to daemon (PID ${pid})`, "info");
+	} catch {
+		ctx.ui.notify("Failed to stop daemon", "error");
+	}
+}
+
 // Pending RPC requests
 interface PendingRequest {
 	id: string;
@@ -245,33 +285,45 @@ interface PendingCompletion {
 const pendingCompletions: PendingCompletion[] = [];
 
 // Load/save config
+function normalizeConfig(raw: unknown): GatewayConfig {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+		throw new Error("Config must be a JSON object");
+	}
+
+	const parsed = raw as Partial<GatewayConfig>;
+	if (parsed.port != null && typeof parsed.port !== "number") {
+		throw new Error("config.port must be a number");
+	}
+	if (parsed.security != null && typeof parsed.security !== "object") {
+		throw new Error("config.security must be an object");
+	}
+	if (parsed.sessions != null && typeof parsed.sessions !== "object") {
+		throw new Error("config.sessions must be an object");
+	}
+
+	return { ...DEFAULT_CONFIG, ...parsed };
+}
+
 function loadConfig(): GatewayConfig {
 	try {
-		if (existsSync(GATEWAY_CONFIG_FILE)) {
-			return {
-				...DEFAULT_CONFIG,
-				...JSON.parse(readFileSync(GATEWAY_CONFIG_FILE, "utf-8")),
-			};
+		if (!existsSync(GATEWAY_CONFIG_FILE)) {
+			// No config file yet — seed from default template
+			const packageRoot = getPackageRoot(import.meta.url);
+			const defaultConfigPath = join(
+				packageRoot,
+				"config",
+				"config.default.json",
+			);
+			if (existsSync(defaultConfigPath)) {
+				if (!existsSync(GATEWAY_CONFIG_DIR)) {
+					mkdirSync(GATEWAY_CONFIG_DIR, { recursive: true });
+				}
+				copyFileSync(defaultConfigPath, GATEWAY_CONFIG_FILE);
+				logger.info("[gateway] Seeded default config at", GATEWAY_CONFIG_FILE);
+			}
 		}
 
-		// No config file yet — seed from default template
-		const packageRoot = getPackageRoot(import.meta.url);
-		const defaultConfigPath = join(
-			packageRoot,
-			"config",
-			"config.default.json",
-		);
-		if (existsSync(defaultConfigPath)) {
-			if (!existsSync(GATEWAY_CONFIG_DIR)) {
-				mkdirSync(GATEWAY_CONFIG_DIR, { recursive: true });
-			}
-			copyFileSync(defaultConfigPath, GATEWAY_CONFIG_FILE);
-			logger.info("[gateway] Seeded default config at", GATEWAY_CONFIG_FILE);
-			return {
-				...DEFAULT_CONFIG,
-				...JSON.parse(readFileSync(GATEWAY_CONFIG_FILE, "utf-8")),
-			};
-		}
+		return normalizeConfig(readGatewayConfig() ?? {});
 	} catch (err) {
 		logger.error(
 			"[gateway] Failed to parse config file — using defaults. Error:",
@@ -315,22 +367,13 @@ function createRpcProcess(): any {
 		"extensions",
 		"pi-gateway-ask-user-rpc.js",
 	);
-	const proc = spawn(
-		"pi",
-		[
-			"--mode",
-			"rpc",
-			"--extension",
-			extensionPath,
-		],
-		{
-			stdio: ["pipe", "pipe", "pipe"],
-			env: {
-				...process.env,
-				OLLAMA_HOST: process.env.OLLAMA_HOST || "localhost:11434",
-			},
+	const proc = spawn("pi", ["--mode", "rpc", "--extension", extensionPath], {
+		stdio: ["pipe", "pipe", "pipe"],
+		env: {
+			...process.env,
+			OLLAMA_HOST: process.env.OLLAMA_HOST || "localhost:11434",
 		},
-	);
+	});
 
 	// Give the interactive bridge a way to write to pi's stdin
 	setStdinWriter((line: string) => {
@@ -1336,21 +1379,7 @@ export default function (pi: ExtensionAPI) {
 						}
 
 						// Spawn detached daemon
-						const entryPoint = new URL("../dist/index.js", import.meta.url)
-							.pathname;
-						const child = spawn(process.execPath, [entryPoint, "--daemon"], {
-							detached: true,
-							stdio: "ignore",
-							env: process.env,
-						});
-						child.unref();
-
-						ctx.ui.notify(
-							`🔌 Gateway daemon started (PID ${child.pid}).\n\n` +
-								"It will keep running after pi closes.\n" +
-								"Use /gateway status to check, /gateway stop to kill.",
-							"info",
-						);
+						startDetachedDaemon(ctx);
 						return;
 					}
 
@@ -1378,17 +1407,7 @@ export default function (pi: ExtensionAPI) {
 				case "stop": {
 					// Handle daemon mode first
 					if (isDaemonRunning()) {
-						try {
-							const rawPid = readFileSync(PID_FILE, "utf-8").trim();
-							const pid = parseInt(rawPid);
-							process.kill(pid, "SIGTERM");
-							ctx.ui.notify(
-								`🛑 Sent stop signal to daemon (PID ${pid})`,
-								"info",
-							);
-						} catch {
-							ctx.ui.notify("Failed to stop daemon", "error");
-						}
+						stopDetachedDaemon(ctx);
 						return;
 					}
 
@@ -1427,12 +1446,9 @@ export default function (pi: ExtensionAPI) {
 					// Show daemon status if detached mode
 					const daemonAlive = isDaemonRunning();
 					if (daemonAlive) {
-						try {
-							const rawPid = readFileSync(PID_FILE, "utf-8").trim();
-							lines.push(`Daemon: 🟢 Running (PID ${rawPid})`);
-						} catch {
-							lines.push("Daemon: 🟢 Running");
-						}
+						lines.push(
+							`Daemon: 🟢 Running (PID ${readDetachedDaemonPid() ?? "unknown"})`,
+						);
 						lines.push("");
 					}
 
@@ -2125,51 +2141,47 @@ export default function (pi: ExtensionAPI) {
 // ═══════════════════════════════════════════════════════════
 
 /**
- * Watch ~/.pi/gateway/config.json for changes and auto-reload.
+ * Watch ~/.pi/gateway/config.json and ~/.pi/gateway/config.local.json for changes.
  * Uses a cache: invalid configs are rejected (logged but not applied).
  */
 function startConfigWatcher(): void {
-	if (!existsSync(GATEWAY_CONFIG_FILE)) return;
+	if (
+		!existsSync(GATEWAY_CONFIG_FILE) &&
+		!existsSync(GATEWAY_CONFIG_LOCAL_FILE)
+	) {
+		return;
+	}
 
 	// Seed the cache with the current valid config
 	let cachedConfig = config;
 
-	watchFile(GATEWAY_CONFIG_FILE, (_curr, _prev) => {
+	const reloadConfig = (): void => {
 		try {
-			const raw = readFileSync(GATEWAY_CONFIG_FILE, "utf-8");
-			const parsed = JSON.parse(raw);
-
-			// Validate shape — must be a plain object with expected fields
-			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-				throw new Error("Config must be a JSON object, got " + typeof parsed);
-			}
-			if (parsed.port != null && typeof parsed.port !== "number") {
-				throw new Error("config.port must be a number");
-			}
-			if (parsed.security != null && typeof parsed.security !== "object") {
-				throw new Error("config.security must be an object");
-			}
-			if (parsed.sessions != null && typeof parsed.sessions !== "object") {
-				throw new Error("config.sessions must be an object");
-			}
-
-			// Valid — apply and update cache
-			config = { ...DEFAULT_CONFIG, ...parsed };
+			config = normalizeConfig(readGatewayConfig() ?? {});
 			cachedConfig = config;
-			logger.info("[pi-gateway] Config reloaded from", GATEWAY_CONFIG_FILE);
+			logger.info(
+				"[pi-gateway] Config reloaded from",
+				GATEWAY_CONFIG_FILE,
+				"+",
+				GATEWAY_CONFIG_LOCAL_FILE,
+			);
 		} catch (err) {
 			logger.error(
 				"[pi-gateway] Invalid config — keeping previous valid config. Error:",
 				err instanceof Error ? err.message : String(err),
 			);
-			// Restore known-good cache
 			config = cachedConfig;
 		}
-	});
+	};
+
+	watchFile(GATEWAY_CONFIG_FILE, reloadConfig);
+	watchFile(GATEWAY_CONFIG_LOCAL_FILE, reloadConfig);
 
 	logger.info(
-		"[pi-gateway] Watching config file for changes:",
+		"[pi-gateway] Watching config files for changes:",
 		GATEWAY_CONFIG_FILE,
+		"+",
+		GATEWAY_CONFIG_LOCAL_FILE,
 	);
 }
 
@@ -2245,7 +2257,7 @@ async function detachAndRun(): Promise<void> {
 		);
 	});
 
-	// ── Config file watcher — auto-reload when ~/.pi/gateway/config.json changes ──
+	// ── Config file watcher — auto-reload when ~/.pi/gateway/config.json or config.local.json changes ──
 	startConfigWatcher();
 }
 
